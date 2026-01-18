@@ -1,0 +1,93 @@
+/*
+Detection Rule: Suspicious Scheduled Task Persistence
+Author: Bryan Jorge
+MITRE ATT&CK: T1053.005 - Scheduled Task/Job
+Severity: Medium
+Description: Detects creation of scheduled tasks with suspicious characteristics indicating persistence mechanism
+*/
+
+(index=windows sourcetype="WinEventLog:Security" EventCode=4698)
+OR
+(index=sysmon EventCode=1 (Image="*\\schtasks.exe" OR ParentImage="*\\schtasks.exe"))
+| rex field=Task_Name "(?<task_name>[^\\]+$)"
+| rex field=CommandLine "(?i)/create.*?/tn\s+\"?(?<created_task>[^\"]+)\"?"
+| eval suspicious_indicators=0
+| eval suspicious_indicators=if(match(Task_Content, "(?i)(powershell|cmd\.exe|wscript|cscript|mshta|regsvr32|rundll32)"), suspicious_indicators+1, suspicious_indicators)
+| eval suspicious_indicators=if(match(Task_Content, "(?i)(http|https|ftp|\\\\\\\\)"), suspicious_indicators+1, suspicious_indicators)
+| eval suspicious_indicators=if(match(Task_Content, "(?i)(-enc|-encodedcommand|-w hidden|-windowstyle hidden)"), suspicious_indicators+1, suspicious_indicators)
+| eval suspicious_indicators=if(match(Task_Content, "(?i)(appdata|temp|public|programdata)"), suspicious_indicators+1, suspicious_indicators)
+| eval suspicious_indicators=if(match(Task_Name, "(?i)(update|windows|system|microsoft|service)") AND NOT match(Task_Name, "^Microsoft"), suspicious_indicators+1, suspicious_indicators)
+| where suspicious_indicators >= 2
+| stats values(Task_Name) as task_names values(Task_Content) as task_commands values(User) as creator earliest(_time) as created_time by Computer suspicious_indicators
+| eval severity=case(
+    suspicious_indicators >= 4, "High",
+    suspicious_indicators = 3, "Medium",
+    1=1, "Low"
+)
+| eval mitre_attack="T1053.005 - Scheduled Task/Job: Scheduled Task"
+| table created_time Computer creator task_names suspicious_indicators task_commands severity mitre_attack
+| sort - suspicious_indicators
+
+/*
+TUNING PARAMETERS:
+- suspicious_indicators >= 2: Threshold for alerting (2-3 recommended)
+- Whitelist known-good tasks: | where NOT task_names IN ("LegitimateTask1", "LegitimateTask2")
+- Adjust regex patterns based on environmental false positives
+
+SUSPICIOUS INDICATORS SCORED:
+1. Execution of scripting engines (PowerShell, cmd, wscript, mshta, etc.)
+2. Network locations or URLs in task command
+3. Obfuscated PowerShell commands (encoded, hidden windows)
+4. Execution from temporary or user-writable directories
+5. Task names mimicking legitimate Windows tasks
+
+FALSE POSITIVES:
+- Software update mechanisms
+- Legitimate administrative tasks
+- Application installers creating maintenance tasks
+- Monitoring agents
+- Backup software
+- Patch management systems
+
+RECOMMENDED RESPONSE:
+1. Review task command line for malicious indicators
+2. Check task trigger schedule (persistence frequency)
+3. Verify task creator account legitimacy
+4. Examine referenced files or scripts
+5. Check task execution history in Task Scheduler logs
+6. Disable task if confirmed malicious
+7. Remove associated files and registry keys
+8. Search for similar tasks across environment
+
+INVESTIGATION QUERIES:
+- View task execution: index=windows EventCode=4688 Process_Name="*schtasks.exe*"
+- Check task runs: index=windows EventCode=4698 OR EventCode=4702 Task_Name=<task_name>
+- Find task file: index=sysmon EventCode=11 TargetFilename="*\\Tasks\\<task_name>"
+
+DETECTION ENHANCEMENTS:
+Consider also monitoring:
+- Tasks created via COM objects (ITaskScheduler interface)
+- Tasks running as SYSTEM
+- Tasks with "Run with highest privileges" enabled
+- Tasks created remotely via RPC
+- Tasks with no triggers (one-time execution)
+
+DATA SOURCES REQUIRED:
+- Windows Security Event Log (EventCode 4698 - Scheduled Task Created)
+- Sysmon (EventCode 1 - Process Creation for schtasks.exe)
+- Task Scheduler operational logs
+- Command line logging enabled
+
+COMMON ATTACKER PATTERNS:
+- Encoded PowerShell downloading additional payloads
+- Tasks executing from AppData or Temp directories
+- Tasks with names mimicking legitimate Windows services
+- Tasks triggering at logon or startup
+- Tasks using AT command (legacy, still seen)
+
+RELATED TECHNIQUES:
+- Registry Run Keys (T1547.001)
+- Windows Services (T1543.003)
+- WMI Event Subscription (T1546.003)
+- Startup Folder (T1547.001)
+*/

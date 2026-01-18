@@ -1,0 +1,104 @@
+/*
+Detection Rule: Unauthorized Administrative Account Creation
+Author: Bryan Jorge
+MITRE ATT&CK: T1136.001 - Create Account: Local Account
+Severity: High
+Description: Detects creation of new user accounts with administrative privileges, potential persistence mechanism
+*/
+
+(index=windows sourcetype="WinEventLog:Security" EventCode=4720)
+| join type=inner Account_Name [search index=windows sourcetype="WinEventLog:Security" EventCode=4732 Group_Name="Administrators"]
+| eval time_to_admin=_time
+| stats earliest(_time) as creation_time latest(time_to_admin) as admin_add_time values(Subject_Account_Name) as creator values(Computer) as created_on by Account_Name
+| eval time_delta=admin_add_time-creation_time
+| eval severity=case(
+    time_delta < 60, "Critical",
+    time_delta < 300, "High", 
+    1=1, "Medium"
+)
+| eval mitre_attack="T1136.001 - Create Account: Local Account"
+| eval suspicious_name=if(match(Account_Name, "(?i)(admin|adm|svc|service|test|temp|backup|support|\$)"), "Yes", "No")
+| table creation_time Account_Name creator created_on time_delta suspicious_name severity mitre_attack
+| sort creation_time
+
+/*
+ALTERNATE DETECTION (Without Join - Better Performance):
+index=windows sourcetype="WinEventLog:Security" (EventCode=4720 OR EventCode=4732)
+| transaction Account_Name maxspan=5m
+| where EventCode=4720 AND EventCode=4732 AND Group_Name="Administrators"
+| table _time Account_Name Subject_Account_Name Computer
+
+TUNING PARAMETERS:
+- time_delta < 60: Account elevated to admin within 60 seconds (very suspicious)
+- maxspan=5m: Time window to correlate account creation with admin addition
+- Whitelist known processes: | where NOT creator IN ("sccm_admin", "provisioning_service")
+
+FALSE POSITIVES:
+- Legitimate IT onboarding processes
+- Automated provisioning systems
+- Help desk creating support accounts
+- Domain join processes
+- System imaging/deployment
+- Vendor support accounts (schedule-based)
+
+RECOMMENDED RESPONSE:
+1. **IMMEDIATE**: Verify account creation was authorized
+2. Contact account creator to confirm legitimacy
+3. Review account activity since creation
+4. Check for suspicious commands or file access
+5. Disable account if unauthorized
+6. Investigate source system for compromise
+7. Review other accounts created by same user
+8. Check for persistence mechanisms (scheduled tasks, services)
+
+INVESTIGATION QUERIES:
+- Account activity: index=windows Account_Name=<new_account> earliest=<creation_time>
+- Creator's recent actions: index=windows Subject_Account_Name=<creator> earliest=-24h
+- Similar accounts: index=windows EventCode=4720 Subject_Account_Name=<creator>
+- Logon history: index=windows EventCode=4624 Account_Name=<new_account>
+
+HIGH-RISK INDICATORS:
+- Account created AND added to Administrators within seconds
+- Account name mimics legitimate admin accounts
+- Created during off-hours (nights/weekends)
+- Creator account is service account or unusual user
+- Created on non-DC system
+- Account name contains: $, temp, test, backup, admin variants
+
+DATA SOURCES REQUIRED:
+- Windows Security Event Log
+  - EventCode 4720: User Account Created
+  - EventCode 4732: Member Added to Security-Enabled Local Group
+- Account management auditing enabled
+- Group membership change auditing configured
+
+DETECTION ENHANCEMENTS:
+Also monitor for:
+- Account added to Domain Admins (EventCode 4728)
+- Account added to other privileged groups (Remote Desktop Users, etc.)
+- Account creation via net user command (EventCode 4688)
+- Account enabled after being disabled (EventCode 4722)
+- Account password never expires flag (EventCode 4738)
+
+ATTACKER TECHNIQUES:
+Common persistence account patterns:
+- Names similar to legitimate accounts (admin1, adm1n, administrat0r)
+- Service account naming (svc_*, service_*)
+- Generic names (support, backup, helpdesk)
+- Hidden accounts with $ suffix
+- Accounts created then immediately used for lateral movement
+
+COMPLEMENTARY DETECTIONS:
+- Scheduled task creation by new account
+- Remote access by new account
+- Service installation by new account
+- Suspicious process execution from new account profile
+
+PREVENTION MEASURES:
+- Implement approval workflow for admin account creation
+- Use privileged access management (PAM) solution
+- Monitor and alert on all admin group changes
+- Require MFA for administrative accounts
+- Regular admin account audits
+- Principle of least privilege enforcement
+*/

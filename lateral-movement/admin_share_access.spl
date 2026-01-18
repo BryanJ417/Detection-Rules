@@ -1,0 +1,99 @@
+/*
+Detection Rule: Suspicious Administrative Share Access
+Author: Bryan Jorge
+MITRE ATT&CK: T1021.002 - SMB/Windows Admin Shares
+Severity: Medium
+Description: Detects access to administrative shares (C$, ADMIN$) potentially indicating lateral movement reconnaissance
+*/
+
+index=windows sourcetype="WinEventLog:Security" EventCode=5140 Share_Name IN ("\\\\*\\C$", "\\\\*\\ADMIN$", "\\\\*\\IPC$")
+| rex field=Share_Name "\\\\\\\\(?<target_host>[^\\]+)\\\\(?<share>[^\\]+)"
+| eval share=upper(share)
+| where share IN ("C$", "ADMIN$", "IPC$")
+| stats count dc(target_host) as unique_targets values(target_host) as targets values(share) as shares_accessed earliest(_time) as first_access latest(_time) as last_access by src_ip Account_Name
+| where unique_targets > 3 OR count > 10
+| eval access_timespan=tostring(last_access-first_access, "duration")
+| eval severity=case(
+    unique_targets >= 10, "High",
+    unique_targets >= 5, "Medium",
+    1=1, "Low"
+)
+| eval mitre_attack="T1021.002 - SMB/Windows Admin Shares"
+| table first_access last_access src_ip Account_Name count unique_targets targets shares_accessed access_timespan severity mitre_attack
+| sort - unique_targets
+
+/*
+TUNING PARAMETERS:
+- unique_targets > 3: Number of systems accessed (3-5 typical for alerting)
+- count > 10: Total access attempts threshold
+- Time window: Consider adding time-based correlation (e.g., span=1h)
+- Whitelist legitimate access: | where NOT (Account_Name="svc_backup" AND src_ip="10.0.1.100")
+
+FALSE POSITIVES:
+- Backup systems accessing multiple hosts
+- Patch management servers
+- System monitoring tools
+- IT helpdesk performing legitimate support
+- Antivirus/EDR management consoles
+- SCCM/deployment servers
+- Network management systems
+
+RECOMMENDED RESPONSE:
+1. Verify if account has legitimate need for admin share access
+2. Check if followed by file access or execution
+3. Review source system for compromise indicators
+4. Investigate account for credential theft
+5. Check for subsequent PSExec or remote WMI usage
+6. Look for data staging or exfiltration activity
+7. Review firewall logs for additional SMB activity
+
+INVESTIGATION QUERIES:
+- File access after share mount: index=windows EventCode=5145 src_ip=<IP> | head 100
+- Check for remote execution: index=windows EventCode=4688 src_ip=<IP>
+- Account activity timeline: index=windows Account_Name=<username> earliest=-24h | sort _time
+- Network mapping: index=windows EventCode=5140 src_ip=<IP> | stats count by target_host
+
+ATTACK CONTEXT:
+Administrative share access is often reconnaissance before:
+- PSExec execution
+- File staging for malware deployment
+- Credential harvesting from remote systems
+- Data collection for exfiltration
+- Ransomware deployment
+
+DATA SOURCES REQUIRED:
+- Windows Security Event Log (EventCode 5140 - Network Share Accessed)
+- File share auditing enabled
+- Object access auditing configured
+- Enhanced SMB logging
+
+DETECTION VARIANTS:
+Consider also monitoring:
+- Failed admin share access attempts (EventCode 5145 with failures)
+- SYSVOL/NETLOGON share access patterns
+- Share access from unusual source networks
+- After-hours admin share access
+- Workstation-to-workstation share access (unusual)
+
+PRIVILEGE REQUIREMENTS:
+Admin share access requires:
+- Administrative credentials on target
+- SMB/445 port accessible
+- Admin$ and C$ shares not disabled
+
+COMMON ATTACKER WORKFLOW:
+1. Compromise initial system
+2. Dump credentials (Mimikatz)
+3. Enumerate network (SMB scanning)
+4. Test admin share access (reconnaissance)
+5. Deploy tools via admin shares
+6. Execute remotely (PSExec, WMI, etc.)
+
+PREVENTION MEASURES:
+- Disable admin shares where not needed
+- Implement SMB signing
+- Use firewall rules to limit SMB traffic
+- Enable enhanced auditing for share access
+- Monitor privileged account usage
+- Implement least privilege access model
+*/

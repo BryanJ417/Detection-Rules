@@ -1,0 +1,122 @@
+/*
+Detection Rule: Registry Run Key Persistence
+Author: Bryan Jorge
+MITRE ATT&CK: T1547.001 - Boot or Logon Autostart Execution: Registry Run Keys
+Severity: Medium
+Description: Detects suspicious modifications to registry Run keys used for persistence
+*/
+
+index=sysmon EventCode=13
+(TargetObject="*\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\\*"
+OR TargetObject="*\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce\\*"
+OR TargetObject="*\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run\\*"
+OR TargetObject="*\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run\\*")
+| rex field=TargetObject "\\\\Run(?:Once)?\\\\(?<registry_key_name>.+)$"
+| eval suspicious=0
+| eval suspicious=if(match(Details, "(?i)(powershell|cmd\.exe|wscript|cscript|mshta|regsvr32|rundll32)"), suspicious+2, suspicious)
+| eval suspicious=if(match(Details, "(?i)(appdata|temp|public|programdata|users\\\\public)"), suspicious+2, suspicious)
+| eval suspicious=if(match(Details, "(?i)(-enc|-encodedcommand|-w hidden|-windowstyle hidden|-nop|-noprofile)"), suspicious+3, suspicious)
+| eval suspicious=if(match(Details, "(?i)(http|https|ftp|\\\\\\\\)"), suspicious+2, suspicious)
+| eval suspicious=if(match(registry_key_name, "(?i)(update|windows|microsoft|adobe|java|system)") AND NOT match(Image, "(?i)(windows|program files)"), suspicious+1, suspicious)
+| where suspicious >= 3
+| stats earliest(_time) as first_seen latest(_time) as last_seen values(registry_key_name) as key_names values(Details) as commands values(Image) as processes by Computer User suspicious
+| eval severity=case(
+    suspicious >= 6, "High",
+    suspicious >= 4, "Medium",
+    1=1, "Low"
+)
+| eval mitre_attack="T1547.001 - Registry Run Keys / Startup Folder"
+| table first_seen last_seen Computer User key_names processes commands suspicious severity mitre_attack
+| sort - suspicious
+
+/*
+TUNING PARAMETERS:
+- suspicious >= 3: Threshold for alerting (adjust 2-4 based on environment)
+- Whitelist legitimate software: | where NOT (processes="C:\\Program Files\\LegitApp\\updater.exe")
+- Consider time-based analysis for after-hours modifications
+
+SUSPICIOUS INDICATORS SCORED:
+1. Scripting engines in command (+2)
+2. Execution from temporary/user-writable directories (+2)
+3. Obfuscated PowerShell commands (+3)
+4. Network locations or URLs (+2)
+5. Legitimate-sounding names from suspicious locations (+1)
+
+FALSE POSITIVES:
+- Software installers adding update mechanisms
+- Legitimate applications auto-starting
+- User-installed applications
+- Chrome/browser helper extensions
+- Cloud storage sync clients
+- Legitimate system utilities
+
+RECOMMENDED RESPONSE:
+1. Verify registry modification was from legitimate installer
+2. Examine referenced executable or script
+3. Check process that created registry key
+4. Review user account that made modification
+5. Search for file referenced in registry value
+6. Check for additional persistence mechanisms
+7. Remove registry key if malicious
+8. Delete associated files
+
+INVESTIGATION QUERIES:
+- File creation timeline: index=sysmon EventCode=11 TargetFilename=<file_path>
+- Process execution: index=sysmon EventCode=1 CommandLine=<command>
+- User activity: index=windows User=<username> earliest=-24h
+- Similar registry changes: index=sysmon EventCode=13 Image=<process> earliest=-7d
+
+REGISTRY LOCATIONS MONITORED:
+- HKLM\Software\Microsoft\Windows\CurrentVersion\Run
+- HKCU\Software\Microsoft\Windows\CurrentVersion\Run  
+- HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnce
+- HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce
+- HKLM\Software\WOW6432Node\...\Run (32-bit on 64-bit)
+- HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run
+
+DATA SOURCES REQUIRED:
+- Sysmon EventCode 13 (Registry Value Set)
+- Registry auditing enabled
+- Sysmon configuration monitoring Run key paths
+
+COMMON ATTACKER PATTERNS:
+- PowerShell downloading and executing payloads
+- Encoded commands to evade detection
+- Executables in temp/appdata directories
+- DLL execution via rundll32
+- Script execution via wscript/cscript
+- Names mimicking legitimate software
+
+DETECTION ENHANCEMENTS:
+Consider also monitoring:
+- Registry key deletions (EventCode 12)
+- Services creation for persistence
+- Startup folder modifications (EventCode 11)
+- Scheduled tasks (EventCode 4698)
+- WMI Event Subscriptions
+
+PERSISTENCE TIMELINE:
+Attackers typically:
+1. Gain initial access
+2. Establish multiple persistence mechanisms
+3. Registry Run keys are common due to:
+   - Ease of creation
+   - Executes at user logon
+   - User-level permissions sufficient
+   - Less monitored than services
+
+PREVENTION MEASURES:
+- Enable registry auditing
+- Implement application whitelisting
+- Monitor registry with Sysmon
+- User awareness training
+- Least privilege access
+- Regular autoruns auditing with Sysinternals
+
+RELATED TECHNIQUES:
+- Startup Folder (T1547.001)
+- Winlogon Helper DLL (T1547.004)  
+- Security Support Provider (T1547.005)
+- Services (T1543.003)
+- Scheduled Tasks (T1053.005)
+*/

@@ -1,0 +1,55 @@
+/*
+Detection Rule: Account Lockout Spike Detection
+Author: Bryan Jorge
+MITRE ATT&CK: T1110.001 - Password Guessing
+Severity: Medium
+Description: Detects unusual spike in account lockouts across the environment, potentially indicating widespread password attack or misconfigured service
+*/
+
+index=windows sourcetype="WinEventLog:Security" EventCode=4740
+| bin _time span=15m
+| stats count dc(Account_Name) as unique_locked_accounts values(Account_Name) as locked_accounts by _time
+| eventstats avg(count) as avg_lockouts stdev(count) as stdev_lockouts
+| eval threshold=avg_lockouts + (2*stdev_lockouts)
+| where count > threshold AND count > 5
+| eval severity="Medium"
+| eval mitre_attack="T1110.001 - Password Guessing"
+| table _time count unique_locked_accounts locked_accounts avg_lockouts threshold severity mitre_attack
+| sort - count
+
+/*
+TUNING PARAMETERS:
+- span=15m: Time bucket for counting lockouts (10-30 minutes recommended)
+- count > 5: Minimum lockouts to trigger (adjust based on org size)
+- 2*stdev: Standard deviation multiplier for anomaly detection (2-3 typical)
+
+FALSE POSITIVES:
+- Service accounts with expired credentials
+- Scheduled tasks running with old passwords
+- Mobile device sync issues
+- VPN authentication problems
+- AD replication delays
+- Password expiration waves
+
+RECOMMENDED RESPONSE:
+1. Identify common patterns in locked accounts (department, naming convention)
+2. Check for service account or application credential issues
+3. Review recent password policy changes
+4. Investigate source systems triggering lockouts
+5. Unlock accounts and force password reset if confirmed attack
+6. Review authentication logs for compromise indicators
+
+INVESTIGATION QUERIES:
+- Source of lockouts: index=windows EventCode=4740 | stats count by Caller_Computer_Name
+- Account patterns: index=windows EventCode=4740 | rex field=Account_Name "(?<prefix>^\w{3})" | stats count by prefix
+- Timeline analysis: index=windows EventCode=4740 | timechart span=5m count
+
+DATA SOURCES REQUIRED:
+- Windows Security Event Log (EventCode 4740 - Account Locked Out)
+- Domain Controller logs
+- Account name field extraction
+
+DETECTION LOGIC:
+Uses statistical baseline to detect anomalous spikes rather than static threshold,
+adapting to environment size and normal lockout patterns.
+*/

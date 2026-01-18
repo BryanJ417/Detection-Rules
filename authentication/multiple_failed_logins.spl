@@ -1,0 +1,215 @@
+/*
+Detection Rule: Multiple Failed Logins Across Accounts
+Author: Bryan Jorge
+MITRE ATT&CK: T1110.001 - Password Guessing, T1110.003 - Password Spraying
+Severity: High
+Description: Detects single source attempting authentication against multiple user accounts with failed logins, indicating password spraying or credential stuffing attack
+*/
+
+index=windows sourcetype="WinEventLog:Security" EventCode=4625
+| bin _time span=10m
+| stats dc(Account_Name) as unique_accounts count as total_attempts values(Account_Name) as targeted_accounts earliest(_time) as first_attempt latest(_time) as last_attempt by _time src_ip Computer
+| where unique_accounts >= 5
+| eval attack_duration=tostring(last_attempt-first_attempt, "duration")
+| eval attempts_per_account=round(total_attempts/unique_accounts, 2)
+| eval attack_type=case(
+    attempts_per_account < 3 AND unique_accounts >= 10, "Password Spraying",
+    attempts_per_account >= 5 AND unique_accounts >= 5, "Credential Stuffing",
+    1=1, "Multiple Account Targeting"
+)
+| eval severity=case(
+    unique_accounts >= 20, "Critical",
+    unique_accounts >= 10, "High",
+    1=1, "Medium"
+)
+| eval mitre_attack=case(
+    attack_type="Password Spraying", "T1110.003 - Password Spraying",
+    attack_type="Credential Stuffing", "T1110.004 - Credential Stuffing",
+    1=1, "T1110.001 - Password Guessing"
+)
+| table first_attempt last_attempt src_ip Computer unique_accounts total_attempts attempts_per_account attack_duration attack_type targeted_accounts severity mitre_attack
+| sort - unique_accounts
+
+/*
+TUNING PARAMETERS:
+- span=10m: Time window for correlation (5-20 minutes typical)
+- unique_accounts >= 5: Minimum unique accounts targeted (3-10 recommended)
+- attempts_per_account thresholds: Adjust based on authentication baseline
+- Whitelist legitimate sources: | where NOT src_ip IN ("10.0.0.5", "10.0.0.10")
+
+ATTACK TYPE CLASSIFICATION:
+- Password Spraying: Few attempts per account, many accounts (< 3 attempts/account, 10+ accounts)
+  Attackers try common passwords against many accounts to avoid lockout
+  
+- Credential Stuffing: Multiple attempts per account (5+ attempts/account, 5+ accounts)
+  Attackers use leaked credential lists from other breaches
+  
+- Multiple Account Targeting: General pattern of targeting various accounts
+
+FALSE POSITIVES:
+- Help desk password reset operations
+- Users with multiple accounts forgetting passwords
+- SSO systems with misconfigured credentials
+- Application service accounts with connection issues
+- VPN authentication retries
+- Mobile device sync problems
+- Password manager failures
+
+RECOMMENDED RESPONSE:
+1. **IMMEDIATE**: Check if any accounts successfully authenticated after failures
+2. Identify source IP and verify if internal or external
+3. Review targeted accounts for patterns (department, naming convention, privilege level)
+4. Check for successful authentications from same source to other systems
+5. Verify if source IP is known VPN endpoint or proxy
+6. Block source IP temporarily if attack is ongoing
+7. Force password reset for targeted accounts if compromise suspected
+8. Enable MFA on targeted accounts if not already enabled
+9. Review logs for 24 hours prior for reconnaissance activity
+
+INVESTIGATION QUERIES:
+- Check for successful logins from same source: index=windows EventCode=4624 src_ip=<IP>
+- Review account lockouts: index=windows EventCode=4740 | stats count by Account_Name
+- Source IP reputation: | lookup threat_intel src_ip OUTPUT reputation
+- Historical activity from source: index=windows src_ip=<IP> earliest=-7d
+- Targeted account analysis: index=windows Account_Name IN (<accounts>) EventCode IN (4624,4625)
+
+PASSWORD SPRAYING INDICATORS:
+High confidence when:
+- 1-2 login attempts per account across 10+ accounts
+- Attempts spread evenly across time (not bursts)
+- Source is external or unexpected internal location
+- Targeted accounts follow pattern (all admin accounts, all service accounts)
+- Same Failure_Reason across all attempts
+- Attempts use common passwords (if you have visibility)
+
+CREDENTIAL STUFFING INDICATORS:
+High confidence when:
+- 5+ attempts per account
+- Attempts use varied passwords (if visible in logs)
+- Source is external IP
+- Multiple accounts from same organization/domain
+- Timing suggests automated tool usage
+- User-Agent strings indicate bot/script
+
+DATA SOURCES REQUIRED:
+- Windows Security Event Log (EventCode 4625 - Failed Logon)
+- Source IP extraction configured
+- Account name parsing enabled
+- Network authentication logging (VPN, web apps, cloud services)
+- Optional: Azure AD/Entra ID sign-in logs for cloud authentication
+
+DETECTION VARIANTS:
+
+Variant 1: Focus on External Sources
+```spl
+| where NOT (src_ip LIKE "10.*" OR src_ip LIKE "192.168.*" OR src_ip LIKE "172.16.*")
+```
+
+Variant 2: Privilege Account Focus
+```spl
+| where match(Account_Name, "(?i)(admin|adm|svc|service|sa)")
+```
+
+Variant 3: Time-Based Analysis
+```spl
+| eval business_hours=if(date_hour>=9 AND date_hour<=17 AND date_wday>=1 AND date_wday<=5, "yes", "no")
+| eval severity=if(business_hours="no", "High", severity)
+```
+
+ENVIRONMENTAL CONSIDERATIONS:
+- Large organizations: Increase unique_accounts threshold (10-15)
+- Small organizations: Decrease threshold (3-5)
+- Cloud-first environments: Include Azure AD/Okta logs
+- VPN-heavy environments: Whitelist VPN gateway IPs
+- Service accounts: Exclude known service account patterns
+
+ATTACK TIMELINE CORRELATION:
+Password spraying typically follows:
+1. Reconnaissance (username enumeration)
+2. Password spraying attempts (this detection)
+3. Successful authentication
+4. Lateral movement or privilege escalation
+
+Look for related activity:
+- LDAP queries before authentication attempts
+- Network scanning from same source
+- Successful logins following failed attempts
+- Unusual access patterns after successful auth
+
+PREVENTION MEASURES:
+- Implement account lockout policies (with caution for spraying)
+- Deploy multi-factor authentication (MFA)
+- Use CAPTCHA for web authentication
+- Implement rate limiting on authentication endpoints
+- Monitor for username enumeration attempts
+- Use strong password policies
+- Deploy password breach detection services
+- Implement conditional access policies
+- Geographic-based access controls
+- Anomaly-based authentication monitoring
+
+COMPARISON TO BRUTE FORCE DETECTION:
+Brute Force Detection:
+- Single account, many attempts
+- Rapidly repeated attempts
+- Goal: Guess one account's password
+
+Multiple Failed Logins (This Rule):
+- Many accounts, few attempts each
+- Spread out over time to avoid detection
+- Goal: Find any valid credential
+
+Both rules should run in parallel for comprehensive authentication attack detection.
+
+INTEGRATION WITH OTHER DETECTIONS:
+Combine with:
+- Successful authentication from new location (T1078)
+- Account lockout spike detection
+- Brute force detection
+- Unusual authentication time detection
+- Impossible travel detection
+
+ADVANCED ANALYSIS:
+Calculate spray pattern confidence score:
+```spl
+| eval pattern_score=0
+| eval pattern_score=if(attempts_per_account < 3, pattern_score+20, pattern_score)
+| eval pattern_score=if(unique_accounts >= 20, pattern_score+30, pattern_score)
+| eval pattern_score=if(attack_duration > 300, pattern_score+20, pattern_score)
+| eval pattern_score=if(match(src_ip, "^(?!10\.|192\.168\.|172\.16\.)"), pattern_score+30, pattern_score)
+| eval confidence=case(
+    pattern_score >= 80, "Very High",
+    pattern_score >= 60, "High",
+    pattern_score >= 40, "Medium",
+    1=1, "Low"
+)
+```
+
+REGULATORY COMPLIANCE:
+This detection helps satisfy:
+- PCI DSS Requirement 8.1.6: Limit repeated access attempts
+- NIST 800-53 AC-7: Unsuccessful Logon Attempts
+- CIS Controls 16.11: Monitor Authentication Attempts
+- HIPAA: Access Control (45 CFR § 164.312(a)(2)(i))
+
+REAL-WORLD ATTACK EXAMPLES:
+- Citrix password spraying campaigns (CVE-2019-19781 exploitation)
+- Office 365 password spraying (common technique)
+- VPN authentication attacks
+- OWA (Outlook Web Access) spraying
+- Kerberos pre-authentication attacks
+
+RESPONSE PLAYBOOK CHECKLIST:
+□ Identify attack type (spraying vs stuffing)
+□ Determine if attack is ongoing
+□ Check for successful authentications
+□ Block source IP if external
+□ Review targeted accounts
+□ Force password reset if needed
+□ Enable MFA on affected accounts
+□ Document incident timeline
+□ Update threat intelligence
+□ Report to management
+□ Review related systems
+□ Implement additional controls
+*/

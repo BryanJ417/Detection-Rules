@@ -1,0 +1,67 @@
+/*
+Detection Rule: PSExec Remote Execution Detection
+Author: Bryan Jorge
+MITRE ATT&CK: T1021.002 - SMB/Windows Admin Shares, T1569.002 - Service Execution
+Severity: High
+Description: Detects PSExec usage for remote command execution, common lateral movement technique
+*/
+
+(index=windows sourcetype="WinEventLog:System" EventCode=7045 Service_Name="PSEXESVC")
+OR
+(index=sysmon EventCode=1 (Image="*\\psexec.exe" OR Image="*\\psexec64.exe" OR CommandLine="*psexec*"))
+OR
+(index=windows sourcetype="WinEventLog:Security" EventCode=5145 Share_Name="\\\\*\\IPC$" Relative_Target_Name="PSEXESVC*")
+| eval detection_method=case(
+    EventCode=7045, "Service Creation",
+    EventCode=1, "Process Execution",
+    EventCode=5145, "Network Share Access",
+    1=1, "Unknown"
+)
+| stats values(detection_method) as detection_methods values(User) as users values(CommandLine) as commands by _time Computer src_ip
+| eval severity="High"
+| eval mitre_attack="T1021.002 - SMB/Windows Admin Shares, T1569.002 - Service Execution"
+| table _time Computer src_ip users detection_methods commands severity mitre_attack
+
+/*
+TUNING PARAMETERS:
+- Can whitelist authorized PSExec usage: | where NOT (src_ip IN ("10.0.1.100") AND User="admin_account")
+- Adjust time correlation window if using transaction command
+- Consider adding dest_ip field for lateral movement mapping
+
+FALSE POSITIVES:
+- Legitimate IT administration using PSExec
+- Authorized remote support tools
+- System management platforms (SCCM, etc.)
+- Patch deployment systems
+- Approved third-party remote admin tools
+
+RECOMMENDED RESPONSE:
+1. Immediately verify if PSExec usage was authorized
+2. Identify source and destination systems
+3. Check what commands were executed remotely
+4. Review account used for execution (should be admin)
+5. Investigate for additional lateral movement from same source
+6. Check for data exfiltration or credential dumping post-execution
+7. Isolate affected systems if unauthorized
+
+INVESTIGATION QUERIES:
+- Find all PSExec activity from source: index=* src_ip=<IP> psexec
+- Check subsequent commands: index=sysmon EventCode=1 Computer=<hostname> | transaction Computer maxspan=5m
+- Network connections: index=sysmon EventCode=3 dest_ip=<target_ip>
+
+DETECTION COVERAGE:
+This rule uses multiple detection points:
+1. Service creation (EventCode 7045) - Catches PSExec service installation
+2. Process execution (Sysmon EventCode 1) - Detects PSExec binary execution
+3. Network share access (EventCode 5145) - Identifies IPC$ share access for PSExec
+
+DATA SOURCES REQUIRED:
+- Windows System Event Log (Service installation)
+- Sysmon logs (Process creation, Network connections)
+- Windows Security Event Log (Share access auditing)
+
+RELATED DETECTIONS:
+- Remote WMI execution (wmic.exe usage)
+- Remote PowerShell sessions (winrs.exe, Enter-PSSession)
+- RDP connections (EventCode 4624 LogonType 10)
+*/

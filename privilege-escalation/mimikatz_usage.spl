@@ -1,0 +1,84 @@
+/*
+Detection Rule: Mimikatz Credential Dumping Detection
+Author: Bryan Jorge
+MITRE ATT&CK: T1003.001 - LSASS Memory Dump
+Severity: Critical
+Description: Detects indicators of Mimikatz or similar credential dumping tools accessing LSASS memory
+*/
+
+(index=sysmon EventCode=10 TargetImage="*\\lsass.exe" GrantedAccess IN ("0x1010", "0x1410", "0x1438", "0x143a", "0x1fffff"))
+OR
+(index=sysmon EventCode=1 (CommandLine="*sekurlsa*" OR CommandLine="*privilege::debug*" OR CommandLine="*lsadump*"))
+OR
+(index=sysmon EventCode=1 (Image="*\\mimikatz.exe" OR OriginalFileName="mimikatz.exe"))
+OR
+(index=windows sourcetype="WinEventLog:Security" EventCode=4656 Object_Name="*\\lsass.exe" Access_Mask IN ("0x1010", "0x1410", "0x1fffff"))
+| eval detection_type=case(
+    EventCode=10, "Process Access to LSASS",
+    EventCode=1 AND match(CommandLine, "(?i)(sekurlsa|privilege::debug|lsadump)"), "Mimikatz Command Line",
+    EventCode=1 AND match(Image, "(?i)mimikatz"), "Mimikatz Binary Execution",
+    EventCode=4656, "LSASS Handle Request",
+    1=1, "Unknown"
+)
+| stats values(detection_type) as detection_types earliest(_time) as first_seen latest(_time) as last_seen values(Image) as process_names values(CommandLine) as commands values(User) as users by Computer
+| eval severity="Critical"
+| eval mitre_attack="T1003.001 - LSASS Memory Dump"
+| eval duration=tostring(last_seen-first_seen, "duration")
+| table first_seen last_seen Computer users process_names detection_types commands duration severity mitre_attack
+
+/*
+TUNING PARAMETERS:
+- GrantedAccess values may need adjustment based on legitimate tools
+- Can whitelist specific security tools: | where NOT (Image="C:\\Program Files\\SecurityTool\\agent.exe")
+- Consider excluding specific service accounts if needed
+
+FALSE POSITIVES:
+- Legitimate security tools (EDR agents, vulnerability scanners)
+- Password managers accessing credential stores
+- System administration tools
+- Memory dump tools (WinDbg, Process Explorer)
+- Backup software
+- Anti-malware scanning LSASS
+
+RECOMMENDED RESPONSE:
+1. **IMMEDIATE**: Isolate affected system from network
+2. Verify if credentials were successfully dumped
+3. Force password reset for all accounts on affected system
+4. Check for Pass-the-Hash activity from same source
+5. Review domain admin and privileged account activity
+6. Search for persistence mechanisms established
+7. Perform full memory and disk forensics
+8. Review recent login activity for compromised accounts
+9. Enable Credential Guard on affected systems going forward
+
+INVESTIGATION QUERIES:
+- Check for lateral movement: index=windows EventCode=4624 LogonType=3 src_ip=<compromised_host>
+- Find other compromised systems: index=sysmon EventCode=10 TargetImage="*lsass.exe" SourceImage=<malicious_process>
+- Timeline all activity: index=* Computer=<hostname> earliest=-24h | sort _time
+
+CRITICAL NOTES:
+- This is typically part of broader attack chain
+- Assume credential compromise until proven otherwise
+- Domain admin credentials at highest risk
+- Often followed by lateral movement within minutes
+- May indicate APT or ransomware precursor
+
+DATA SOURCES REQUIRED:
+- Sysmon (EventCode 10 - Process Access, EventCode 1 - Process Creation)
+- Windows Security Log (EventCode 4656 - Handle to Object Requested)
+- Process command line logging enabled
+- LSASS auditing configured
+
+DETECTION VARIANTS:
+This rule catches multiple Mimikatz techniques:
+1. Direct LSASS memory access
+2. Mimikatz command-line patterns
+3. Mimikatz binary execution
+4. LSASS handle requests with suspicious access masks
+
+RELATED INDICATORS:
+- ProcDump.exe dumping LSASS
+- Comsvcs.dll MiniDump technique
+- Task Manager creating LSASS dump
+- PowerShell Invoke-Mimikatz usage
+*/

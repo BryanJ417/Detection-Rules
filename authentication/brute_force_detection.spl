@@ -1,0 +1,47 @@
+/*
+Detection Rule: Brute Force Authentication Attack
+Author: Bryan Jorge
+MITRE ATT&CK: T1110 - Brute Force
+Severity: High
+Description: Detects multiple failed login attempts from a single source IP within a short timeframe, indicating potential brute force attack
+*/
+
+index=windows sourcetype="WinEventLog:Security" EventCode=4625
+| bin _time span=5m
+| stats count dc(Account_Name) as unique_accounts values(Account_Name) as attempted_accounts by _time src_ip Computer
+| where count > 10
+| eval severity="High"
+| eval mitre_attack="T1110 - Brute Force"
+| table _time src_ip Computer count unique_accounts attempted_accounts severity mitre_attack
+| sort - count
+
+/*
+TUNING PARAMETERS:
+- span=5m: Adjust time window based on environment (5-15 minutes typical)
+- count > 10: Adjust threshold based on baseline (10-25 failures typical)
+- Can add exclusion for known scanning sources: | where NOT src_ip IN ("10.0.0.1", "10.0.0.2")
+
+FALSE POSITIVES:
+- Legitimate users with forgotten passwords
+- Automated systems with expired credentials
+- Vulnerability scanners
+- Password policy enforcement testing
+
+RECOMMENDED RESPONSE:
+1. Verify source IP is external or unexpected internal host
+2. Check if any login attempts succeeded after failures
+3. Investigate target accounts for compromise
+4. Consider temporary IP blocking if attack is ongoing
+5. Review firewall logs for additional suspicious activity from source
+6. Validate MFA status on targeted accounts
+
+INVESTIGATION QUERIES:
+- Check for successful logins from same IP: index=windows EventCode=4624 src_ip=<IP>
+- Review account activity: index=windows Account_Name=<username>
+- Historical analysis: Search same IP over past 30 days
+
+DATA SOURCES REQUIRED:
+- Windows Security Event Log (EventCode 4625 - Failed Logon)
+- Source IP mapping enabled
+- Account name parsing configured
+*/
