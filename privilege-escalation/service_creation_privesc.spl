@@ -1,0 +1,141 @@
+/*
+Detection Rule: Suspicious Service Installation
+Author: Bryan Jorge
+MITRE ATT&CK: T1543.003 - Create or Modify System Process: Windows Service
+Severity: Medium
+Description: Detects creation of Windows services with suspicious characteristics indicating persistence or privilege escalation
+*/
+
+index=windows sourcetype="WinEventLog:System" EventCode=7045
+| eval suspicious_indicators=0
+| eval suspicious_indicators=if(match(Service_File_Name, "(?i)(powershell|cmd\.exe|wscript|cscript|mshta|regsvr32|rundll32|certutil)"), suspicious_indicators+2, suspicious_indicators)
+| eval suspicious_indicators=if(match(Service_File_Name, "(?i)(appdata|temp|public|programdata|users\\\\public|\\$recycle)"), suspicious_indicators+2, suspicious_indicators)
+| eval suspicious_indicators=if(match(Service_File_Name, "(?i)(-enc|-encodedcommand|-w hidden|invoke-expression|downloadstring)"), suspicious_indicators+3, suspicious_indicators)
+| eval suspicious_indicators=if(match(Service_File_Name, "(?i)(http|https|ftp|\\\\\\\\)"), suspicious_indicators+2, suspicious_indicators)
+| eval suspicious_indicators=if(match(Service_Name, "(?i)(update|windows|microsoft|system|adobe|java|service)") AND NOT match(Service_File_Name, "(?i)(windows|program files)"), suspicious_indicators+1, suspicious_indicators)
+| eval suspicious_indicators=if(Service_Start_Type="auto start", suspicious_indicators+1, suspicious_indicators)
+| where suspicious_indicators >= 3
+| lookup local=true service_whitelist Service_Name OUTPUT whitelist_reason
+| where isnull(whitelist_reason)
+| stats earliest(_time) as first_seen latest(_time) as last_seen values(Service_Name) as service_names values(Service_File_Name) as service_paths values(Service_Start_Type) as start_types values(Account_Name) as service_accounts by Computer suspicious_indicators
+| eval severity=case(
+    suspicious_indicators >= 6, "High",
+    suspicious_indicators >= 4, "Medium",
+    1=1, "Low"
+)
+| eval mitre_attack="T1543.003 - Windows Service"
+| table first_seen last_seen Computer service_names service_accounts service_paths start_types suspicious_indicators severity mitre_attack
+| sort - suspicious_indicators
+
+/*
+TUNING PARAMETERS:
+- suspicious_indicators >= 3: Adjust threshold (2-4 recommended)
+- Whitelist known services via lookup table
+- Consider time-based correlation with other suspicious activity
+- Adjust service name patterns based on environment
+
+SUSPICIOUS INDICATORS SCORED:
+1. Scripting engines or LOLBins in service path (+2)
+2. Execution from temp/user directories (+2)
+3. Obfuscated commands or encoded PowerShell (+3)
+4. Network locations in service path (+2)
+5. Mimics legitimate service names from wrong location (+1)
+6. Auto-start configuration (+1)
+
+FALSE POSITIVES:
+- Legitimate software installers
+- Monitoring agents and EDR tools
+- Backup software
+- System management tools
+- Enterprise software deployments
+- Printer services
+- Update mechanisms
+
+RECOMMENDED RESPONSE:
+1. Check if service creation was authorized
+2. Review service executable and command line
+3. Verify service account privileges
+4. Check for service execution attempts
+5. Examine files in service path location
+6. Investigate account that created service
+7. Stop and delete service if malicious
+8. Remove associated files
+9. Check for additional persistence mechanisms
+
+INVESTIGATION QUERIES:
+- Service execution: index=windows EventCode=4688 Process_Name=<service_path>
+- Service starts: index=windows EventCode=7036 Service_Name=<service_name>
+- File creation: index=sysmon EventCode=11 TargetFilename=<service_path>
+- Who created service: index=windows EventCode=4697 Service_Name=<service_name>
+- Process tree: index=sysmon EventCode=1 ParentImage=<service_path>
+
+HIGH-RISK SCENARIOS:
+- Service running PowerShell with encoded commands
+- Service downloading and executing from internet
+- Service created by non-admin process
+- Service configured to run as SYSTEM
+- Service with no company/version information
+- Service created during/after known compromise indicator
+
+DATA SOURCES REQUIRED:
+- Windows System Event Log (EventCode 7045 - Service Installed)
+- Windows Security Event Log (EventCode 4697 - Service Installation)
+- Service creation auditing enabled
+- Sysmon for enhanced process tracking
+
+SERVICE TYPES MONITORED:
+- Kernel Driver (0x1)
+- File System Driver (0x2)
+- Adapter (0x4)
+- Recognizer Driver (0x8)
+- Win32 Own Process (0x10)
+- Win32 Share Process (0x20)
+- Interactive Process (0x100)
+
+ATTACKER SERVICE PATTERNS:
+Common malicious service characteristics:
+- Generic service names (service, svc, helper)
+- Typosquatting legitimate names (wuauservv, svvhost)
+- Random character names (xkfjeoiw)
+- Running from suspicious paths
+- No digital signature
+- Created remotely via sc.exe or PSExec
+
+PRIVILEGE ESCALATION CONTEXT:
+Services can escalate privileges through:
+- Running as SYSTEM account
+- Weak service permissions
+- Unquoted service paths
+- DLL hijacking opportunities
+- Service binary replacement
+
+DETECTION ENHANCEMENTS:
+Also monitor for:
+- Service modifications (EventCode 7040)
+- Service started (EventCode 7036)
+- Service stopped (EventCode 7036)
+- Remote service creation via sc.exe
+- WMI service creation
+
+PREVENTION MEASURES:
+- Restrict service creation permissions
+- Monitor service creation with SIEM
+- Implement application whitelisting
+- Use signed binaries only
+- Regular service audits
+- Endpoint protection with behavioral detection
+- Least privilege for service accounts
+
+COMMON MALWARE USING SERVICES:
+- Ransomware (for boot persistence)
+- RATs (backdoor persistence)
+- Cryptominers (resource access)
+- Rootkits (kernel-level access)
+- APT malware (long-term persistence)
+
+RELATED TECHNIQUES:
+- Scheduled Tasks (T1053.005)
+- Registry Run Keys (T1547.001)
+- WMI Event Subscription (T1546.003)
+- DLL Side-Loading (T1574.002)
+*/
