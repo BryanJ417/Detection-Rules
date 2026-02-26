@@ -1,0 +1,130 @@
+/*
+Detection Rule: Azure Entra ID Impossible Travel Login
+Author: Bryan Jorge
+MITRE ATT&CK: T1078.004 - Valid Accounts: Cloud Accounts
+Severity: High
+Description: Detects when a user account authenticates from two geographically
+distant locations within a time window that makes physical travel impossible
+(default: >500km apart within 60 minutes). This indicates either credential
+theft with concurrent use, or use of anonymizing proxies and VPNs to mask
+the attacker's true origin. Uses the Haversine formula to calculate
+great-circle distance between consecutive sign-in geolocations.
+*/
+
+index=azure_aad sourcetype="azure:aad:signin"
+    resultType=0
+
+| eval user=properties.userPrincipalName
+| eval ip=properties.ipAddress
+| eval country=spath(properties.location, "countryOrRegion")
+| eval city=spath(properties.location, "city")
+| eval lat=spath(properties.location, "geoCoordinates.latitude")
+| eval lon=spath(properties.location, "geoCoordinates.longitude")
+| eval app=properties.appDisplayName
+| eval client_app=properties.clientAppUsed
+| eval mfa_method=spath(properties.authenticationDetails{0}, "authenticationMethod")
+| eval conditional_access=properties.conditionalAccessStatus
+
+/* Sort events per user by time to compare sequential logins */
+| sort user, _time
+| streamstats window=2 current=true
+    values(ip)    AS login_ips,
+    values(lat)   AS latitudes,
+    values(lon)   AS longitudes,
+    values(city)  AS cities,
+    values(country) AS countries,
+    min(_time) AS login_1_time,
+    max(_time) AS login_2_time
+    by user
+
+| eval time_delta_min=round((login_2_time - login_1_time) / 60, 2)
+| where mvcount(split(latitudes, ";"))=2 AND time_delta_min < 60 AND time_delta_min > 0
+
+/* Haversine great-circle distance calculation */
+| eval lat1=tonumber(mvindex(split(latitudes,";"),0))
+| eval lat2=tonumber(mvindex(split(latitudes,";"),1))
+| eval lon1=tonumber(mvindex(split(longitudes,";"),0))
+| eval lon2=tonumber(mvindex(split(longitudes,";"),1))
+| eval R=6371
+| eval dlat=(lat2-lat1)*0.017453293
+| eval dlon=(lon2-lon1)*0.017453293
+| eval a=pow(sin(dlat/2),2) + cos(lat1*0.017453293)*cos(lat2*0.017453293)*pow(sin(dlon/2),2)
+| eval distance_km=round(R*2*asin(sqrt(a)),0)
+
+| where distance_km > 500
+
+| eval speed_kmh=round(distance_km / (time_delta_min / 60), 0)
+
+/* Score based on distance, speed, and authentication context */
+| eval risk_score=0
+| eval risk_score=if(distance_km > 5000 AND time_delta_min < 30,    risk_score+60, risk_score)
+| eval risk_score=if(distance_km > 2000 AND time_delta_min < 30,    risk_score+45, risk_score)
+| eval risk_score=if(distance_km > 1000,                            risk_score+30, risk_score)
+| eval risk_score=if(distance_km > 500,                             risk_score+15, risk_score)
+| eval risk_score=if(mfa_method="Password",                         risk_score+15, risk_score)
+| eval risk_score=if(conditional_access="notApplied",               risk_score+10, risk_score)
+
+| eval alert_title="Impossible Travel Detected: " . user
+| table _time, alert_title, user, login_ips, countries, cities,
+        distance_km, time_delta_min, speed_kmh, app,
+        client_app, mfa_method, conditional_access, risk_score
+| sort -risk_score
+
+/*
+TUNING PARAMETERS:
+- distance_km threshold: Raise to 1000km in organizations with heavy VPN use
+  where VPN exit nodes span multiple countries
+- time_delta_min window: Widen to 120 to catch slower-moving attacker patterns
+- mfa_method filter: Add | where mfa_method="Password" to focus on non-MFA sessions
+- Whitelist examples:
+  | where NOT match(login_ips, "^<vpn-gateway-ip1>|^<vpn-gateway-ip2>")
+  | where NOT match(user, "svc-|automation@|sync@")
+
+FALSE POSITIVES:
+- Users connecting through corporate VPN with exit nodes in different countries
+- Shared service accounts used by globally distributed teams
+- Users switching between corporate VPN server locations between sessions
+- Mobile users switching between cellular and WiFi networks with different geolocation
+
+RECOMMENDED RESPONSE:
+1. Contact the user immediately to verify whether they are traveling or using a VPN
+2. Check Azure Identity Protection for correlated risky sign-in events on the same UPN
+3. Identify which applications were accessed from each location
+4. If unconfirmed: revoke all refresh tokens using Revoke-AzureADUserAllRefreshToken
+5. Require the user to re-register MFA if the second factor may be compromised
+6. Audit Exchange inbox rules and SharePoint permissions set during the anomalous session
+
+INVESTIGATION QUERIES:
+- Full sign-in history: index=azure_aad sourcetype="azure:aad:signin"
+  properties.userPrincipalName=<user> earliest=-24h
+  | table _time, properties.ipAddress, properties.location.countryOrRegion,
+    properties.appDisplayName, resultType, properties.authenticationDetails{0}.authenticationMethod
+- Inbox rules created: index=o365 Operation="New-InboxRule" UserId=<user> earliest=<first_seen>
+  | table _time, Parameters
+- OAuth consents granted: index=azure_aad sourcetype="azure:aad:audit"
+  operationName="Consent to application" properties.initiatedBy.user.userPrincipalName=<user>
+
+DATA SOURCES REQUIRED:
+- Azure Entra ID Sign-In Logs (streamed via Diagnostic Settings to Event Hub → Splunk)
+- Splunk Add-on for Microsoft Cloud Services configured for azure:aad:signin sourcetype
+
+HIGH-RISK INDICATORS:
+- Source IP resolves to a known proxy, VPN provider, or Tor exit node
+- MFA method is Password only (no second factor, or legacy authentication)
+- Conditional Access policy was bypassed or not applied
+- Applications accessed include Exchange, SharePoint, Teams, or Azure portal
+
+PREVENTION MEASURES:
+- Deploy Conditional Access Named Locations policy to restrict access to trusted countries
+- Enable Entra ID Identity Protection sign-in risk policy requiring MFA on risky logins
+- Block legacy authentication protocols that bypass Conditional Access via policy
+- Enforce FIDO2 or Certificate-Based Authentication for privileged accounts
+
+RELATED TECHNIQUES:
+- T1078 - Valid Accounts (parent technique)
+- T1539 - Steal Web Session Cookie
+- T1110.003 - Brute Force: Password Spraying
+
+CHANGELOG:
+v1.0 (2026-02-17): Initial release
+*/

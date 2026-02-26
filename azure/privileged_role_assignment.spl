@@ -1,0 +1,143 @@
+/*
+Detection Rule: Azure Privileged Role Assignment Outside PIM
+Author: Bryan Jorge
+MITRE ATT&CK: T1098.003 - Account Manipulation: Additional Cloud Roles
+Severity: Critical
+Description: Detects assignment of high-privilege Azure AD or Azure RBAC roles
+outside of Privileged Identity Management (PIM) workflows, or permanent
+assignments that bypass PIM's time-limited activation model. Attackers who
+gain access to a Global Administrator account will often make direct role
+assignments to backdoor accounts for persistent elevated access. All
+permanent direct assignments to the monitored high-privilege roles should
+be treated as high-confidence malicious activity in environments with PIM.
+*/
+
+index=azure_activity sourcetype="azure:audit"
+    (operationName="Add member to role"
+     OR operationName="Add eligible member to role"
+     OR operationName="Microsoft.Authorization/roleAssignments/write"
+     OR operationName="Activate eligible assignment")
+    resultType="Success"
+
+| eval actor=coalesce(
+    properties.initiatedBy.user.userPrincipalName,
+    properties.initiatedBy.app.displayName,
+    "unknown_actor")
+
+| eval target_user=coalesce(
+    spath(properties.targetResources{0}, "userPrincipalName"),
+    spath(properties.targetResources{0}, "displayName"))
+
+| eval role_assigned=spath(properties.targetResources{1}, "displayName")
+
+| eval assignment_type=case(
+    operationName="Add eligible member to role",              "PIM Eligible Assignment",
+    operationName="Activate eligible assignment",             "PIM Activation",
+    operationName="Add member to role",                       "Permanent Direct Assignment",
+    operationName="Microsoft.Authorization/roleAssignments/write", "Azure RBAC Assignment",
+    1==1,                                                     "Unknown")
+
+| eval scope=properties.targetResources{0}.id
+
+/* Flag high-privilege roles */
+| eval is_privileged=if(match(role_assigned,
+    "Global Administrator|Privileged Role Administrator|" .
+    "Application Administrator|Exchange Administrator|" .
+    "User Access Administrator|Security Administrator|" .
+    "Hybrid Identity Administrator|Cloud Application Administrator|" .
+    "Owner|Contributor|SharePoint Administrator"),
+    1, 0)
+
+| where is_privileged=1
+
+| eval is_pim_bypass=if(assignment_type="Permanent Direct Assignment", 1, 0)
+
+/* Score based on role sensitivity and whether PIM was bypassed */
+| eval risk_score=0
+| eval risk_score=if(is_pim_bypass=1 AND
+    match(role_assigned,"Global Administrator|Privileged Role Administrator"), risk_score+70, risk_score)
+| eval risk_score=if(is_pim_bypass=1 AND
+    match(role_assigned,"Owner|User Access Administrator"),                    risk_score+60, risk_score)
+| eval risk_score=if(is_pim_bypass=1,                                         risk_score+45, risk_score)
+| eval risk_score=if(match(role_assigned,
+    "Global Administrator|Privileged Role Administrator"),                     risk_score+30, risk_score)
+| eval risk_score=if(match(role_assigned, "Owner"),                           risk_score+20, risk_score)
+| eval risk_score=if(assignment_type="Azure RBAC Assignment",                 risk_score+10, risk_score)
+
+| stats
+    count                       AS assignment_count,
+    values(role_assigned)       AS roles_assigned,
+    values(assignment_type)     AS assignment_types,
+    values(target_user)         AS target_users,
+    values(sourceIPAddress)     AS actor_ips,
+    values(scope)               AS scopes,
+    min(_time)                  AS first_seen,
+    max(_time)                  AS last_seen
+    by actor, is_pim_bypass, risk_score
+
+| eval alert_title="Privileged Role Assignment Detected: " . actor
+| table _time, alert_title, actor, roles_assigned, target_users,
+        assignment_types, is_pim_bypass, scopes,
+        actor_ips, assignment_count, risk_score, first_seen, last_seen
+| sort -risk_score
+
+/*
+TUNING PARAMETERS:
+- role_assigned exclusions: Remove lower-risk roles (Contributor) from is_privileged
+  check if they produce excessive volume in your environment
+- PIM-only environments: Add | where is_pim_bypass=1 to alert only on PIM bypass events
+  if your org has fully adopted PIM
+- Whitelist examples:
+  | where NOT match(actor, "ProvisioningConnector|HRSyncApp|IdentityGovernance")
+  | where NOT match(roles_assigned, "Contributor|Reader")
+
+FALSE POSITIVES:
+- Legitimate IT admin onboarding workflows provisioned by the IAM/identity team
+- Approved break-glass account provisioning during incident response
+- Automated provisioning via HR-connected identity governance workflows
+- Service principal-driven role assignments for approved enterprise applications
+
+RECOMMENDED RESPONSE:
+1. Verify whether a change management ticket exists for this role assignment
+2. Confirm the actor's identity and whether their account may be compromised
+3. Review what the newly privileged account has done since the assignment was made
+4. Immediately remove the unauthorized role assignment via Entra ID portal
+5. Revoke all active sessions for the target account that received the elevated role
+6. Audit all changes made by the actor and target account since the assignment
+
+INVESTIGATION QUERIES:
+- Actor's full audit trail: index=azure_activity sourcetype="azure:audit"
+  properties.initiatedBy.user.userPrincipalName=<actor> earliest=-48h
+  | table _time, operationName, resultType, properties.targetResources{0}.displayName
+- Target account actions post-assignment: index=azure_activity sourcetype="azure:audit"
+  properties.initiatedBy.user.userPrincipalName=<target_user> earliest=<first_seen>
+  | table _time, operationName, properties
+- OAuth consents by new admin: index=azure_aad sourcetype="azure:aad:audit"
+  operationName="Consent to application"
+  properties.initiatedBy.user.userPrincipalName=<target_user> earliest=<first_seen>
+  | table _time, properties.targetResources{0}.displayName
+
+DATA SOURCES REQUIRED:
+- Azure Entra ID Audit Logs (streamed via Diagnostic Settings to Event Hub → Splunk)
+- Azure Activity Logs for RBAC assignment events
+
+HIGH-RISK INDICATORS:
+- Assignment occurs outside business hours or from an unusual IP for the actor
+- Permanent assignment (is_pim_bypass=1) rather than PIM eligible assignment
+- Actor's account was involved in a risky sign-in event within the last 24 hours
+- Target account was recently created (new account receiving immediate admin role)
+
+PREVENTION MEASURES:
+- Enforce PIM for all privileged role assignments — zero permanent direct assignments
+- Require approval workflow and written justification for Global Admin activations
+- Enable Entra ID Access Reviews on a quarterly cadence for all privileged roles
+- Alert on any role assignments made by accounts not in the approved IAM team group
+
+RELATED TECHNIQUES:
+- T1078.004 - Valid Accounts: Cloud Accounts
+- T1136.003 - Create Account: Cloud Account
+- T1548.005 - Temporary Elevated Cloud Access
+
+CHANGELOG:
+v1.0 (2026-02-17): Initial release
+*/

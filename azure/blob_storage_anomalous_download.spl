@@ -1,0 +1,134 @@
+/*
+Detection Rule: Azure Blob Storage Anomalous Download Activity
+Author: Bryan Jorge
+MITRE ATT&CK: T1530 - Data from Cloud Storage
+Severity: High
+Description: Detects anomalous bulk read activity against Azure Blob Storage
+containers including high-volume GetBlob operations, access via AzCopy or
+command-line tooling, SAS token authenticated bulk reads, and anonymous
+access to storage containers. Blob storage frequently contains sensitive
+business data, application backups, and credentials — making it a high-value
+exfiltration target when Azure credentials are compromised.
+*/
+
+index=azure_storage sourcetype="azure:storage:blob"
+    operationName IN ("GetBlob", "GetBlobProperties", "ListBlobs", "GetContainerProperties")
+    statusCode=200
+
+| eval actor=coalesce(properties.callerIpAddress, identity.requester.objectId)
+| eval account_name=resourceId
+| eval container_name=properties.containerName
+| eval blob_name=properties.blobName
+| eval bytes_read=coalesce(properties.contentLengthHeader, 0)
+| eval auth_type=properties.authenticationType
+| eval user_agent=properties.userAgentHeader
+
+/* Classify the requesting client tool type */
+| eval requester_type=case(
+    match(user_agent, "azcopy|AzCopy"),                    "AzCopy",
+    match(user_agent, "python-azure|azure-storage-python"), "Python SDK",
+    match(user_agent, "curl|wget"),                         "Command Line",
+    match(auth_type, "Anonymous"),                          "Anonymous",
+    match(auth_type, "SAS"),                                "SAS Token",
+    1==1,                                                   "Azure SDK")
+
+/* Aggregate per storage account per 15-minute window */
+| bin _time span=15m
+| stats
+    count                       AS blob_reads,
+    dc(container_name)          AS distinct_containers,
+    dc(blob_name)               AS distinct_blobs,
+    sum(bytes_read)             AS total_bytes,
+    values(container_name)      AS containers_accessed,
+    values(requester_type)      AS requester_types,
+    values(user_agent)          AS agents,
+    values(auth_type)           AS auth_methods,
+    values(actor)               AS actor_ips,
+    min(_time)                  AS first_seen,
+    max(_time)                  AS last_seen
+    by account_name, _time
+
+| eval total_mb=round(total_bytes / 1048576, 2)
+
+| where blob_reads > 200
+    OR distinct_containers > 5
+    OR total_mb > 500
+    OR match(requester_types, "Anonymous|Command Line")
+
+/* Score based on volume, tool type, and auth method */
+| eval risk_score=0
+| eval risk_score=if(match(auth_methods,"Anonymous") AND total_mb > 100,     risk_score+65, risk_score)
+| eval risk_score=if(match(requester_types,"AzCopy") AND total_mb > 500,     risk_score+55, risk_score)
+| eval risk_score=if(match(requester_types,"Command Line") AND blob_reads>100, risk_score+50, risk_score)
+| eval risk_score=if(blob_reads > 1000 AND distinct_containers > 5,          risk_score+45, risk_score)
+| eval risk_score=if(match(auth_methods,"Anonymous"),                        risk_score+30, risk_score)
+| eval risk_score=if(total_mb > 500,                                         risk_score+20, risk_score)
+| eval risk_score=if(blob_reads > 200,                                       risk_score+10, risk_score)
+
+| eval alert_title="Azure Blob Storage Exfiltration Suspected: " . account_name
+| table _time, alert_title, account_name, blob_reads, distinct_containers,
+        distinct_blobs, total_mb, containers_accessed,
+        requester_types, auth_methods, actor_ips,
+        risk_score, first_seen, last_seen
+| sort -risk_score
+
+/*
+TUNING PARAMETERS:
+- blob_reads threshold: Establish baseline per storage account over 30 days;
+  set threshold at mean + 2 standard deviations per account
+- total_mb threshold: Adjust based on largest legitimate ETL workload in environment
+- Whitelist examples:
+  | where NOT match(account_name, "backupsa|datasync|etlpipeline|azbackup")
+  | where NOT match(requester_types, "Azure SDK")
+  | where account_name!="<known-media-streaming-storage-account>"
+
+FALSE POSITIVES:
+- Azure Data Factory or Synapse Analytics pipelines performing bulk reads for ETL
+- AzCopy used by approved backup or data migration projects
+- Media streaming services reading large blob assets at high volume
+- Azure Backup or Azure Site Recovery performing scheduled backup reads
+
+RECOMMENDED RESPONSE:
+1. Identify the requesting entity — service principal object ID, user, or anonymous
+2. Determine if this is a known scheduled data pipeline or an ad-hoc request
+3. Assess the data classification of the containers accessed
+4. Rotate SAS tokens if SAS authentication was involved
+5. Apply network ACL to restrict storage account access to approved VNet subnets
+6. If anonymous access confirmed: disable public blob access on the storage account immediately
+
+INVESTIGATION QUERIES:
+- All blobs accessed by actor: index=azure_storage sourcetype="azure:storage:blob"
+  properties.callerIpAddress=<actor_ip> earliest=<first_seen> latest=<last_seen>
+  | stats count by properties.containerName, properties.blobName
+- Anonymous access check: index=azure_storage sourcetype="azure:storage:blob"
+  properties.authenticationType="Anonymous" account_name=<account_name>
+  | table _time, properties.containerName, properties.blobName, properties.callerIpAddress
+- Current public access status: index=azure_activity
+  operationName="Microsoft.Storage/storageAccounts/read"
+  resourceId=<account_name> | table _time, properties.responseBody
+
+DATA SOURCES REQUIRED:
+- Azure Storage Diagnostic Logs (enabled per-storage-account under Diagnostic Settings)
+- Must stream StorageRead logs via Event Hub or Azure Monitor to Splunk
+- This logging is NOT enabled by default on storage accounts
+
+HIGH-RISK INDICATORS:
+- auth_type is Anonymous (no credentials required — data is publicly readable)
+- AzCopy tool used with high volume (purpose-built for bulk transfer)
+- Source IP resolves to a residential ISP or known VPN provider
+- Access patterns follow enumerate-then-download: ListBlobs → GetBlob sequence
+
+PREVENTION MEASURES:
+- Enforce private endpoints for all storage accounts containing sensitive data
+- Apply Azure Policy to deny public blob access at the subscription level
+- Disable shared key access and require Azure AD authentication for all storage
+- Enable Microsoft Defender for Storage for real-time anomaly alerting
+
+RELATED TECHNIQUES:
+- T1619 - Cloud Storage Object Discovery
+- T1537 - Transfer Data to Cloud Account
+- T1078.004 - Valid Accounts: Cloud Accounts
+
+CHANGELOG:
+v1.0 (2026-02-17): Initial release
+*/

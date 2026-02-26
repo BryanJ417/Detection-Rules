@@ -1,0 +1,133 @@
+/*
+Detection Rule: AWS S3 Bucket Public Exposure via Policy or ACL Change
+Author: Bryan Jorge
+MITRE ATT&CK: T1530 - Data from Cloud Storage
+              T1098 - Account Manipulation
+Severity: Critical
+Description: Detects when an S3 bucket is intentionally or accidentally exposed
+to the public via bucket policy changes granting Principal "*", ACL changes
+setting public-read/write, disabling Block Public Access settings, or deletion
+of a restrictive bucket policy. Attackers may intentionally expose buckets
+containing sensitive data as a data extortion tactic or to stage exfiltration
+without using their own credentials.
+*/
+
+index=aws_cloudtrail sourcetype="aws:cloudtrail"
+    eventSource="s3.amazonaws.com"
+    eventName IN (
+        "PutBucketPolicy", "PutBucketAcl",
+        "DeleteBucketPolicy", "PutBucketPublicAccessBlock"
+    )
+    errorCode=""
+
+| eval actor=coalesce(userIdentity.userName, userIdentity.principalId)
+| eval bucket_name=requestParameters.bucketName
+| eval bucket_acl=requestParameters.AccessControlPolicy.AccessControlList.Grant.Grantee.URI
+| eval policy_doc=requestParameters.bucketPolicy
+| eval public_access_cfg=requestParameters.PublicAccessBlockConfiguration
+
+/* Detect specific public exposure conditions */
+| eval public_acl=if(
+    match(bucket_acl, "AllUsers|AuthenticatedUsers"), 1, 0)
+
+| eval public_policy=if(
+    match(policy_doc, "\"Principal\"\s*:\s*\"\*\"") OR
+    match(policy_doc, "\"Principal\"\s*:\s*\{\"AWS\"\s*:\s*\"\*\"\}"),
+    1, 0)
+
+| eval block_public_disabled=if(
+    eventName="PutBucketPublicAccessBlock" AND (
+        match(public_access_cfg, "\"BlockPublicAcls\"\s*:\s*false") OR
+        match(public_access_cfg, "\"BlockPublicPolicy\"\s*:\s*false")),
+    1, 0)
+
+| eval policy_deleted=if(eventName="DeleteBucketPolicy", 1, 0)
+
+| where public_acl=1 OR public_policy=1 OR block_public_disabled=1 OR policy_deleted=1
+
+| eval exposure_type=case(
+    public_acl=1,            "Public ACL Applied",
+    public_policy=1,         "Public Bucket Policy Applied",
+    block_public_disabled=1, "Block Public Access Disabled",
+    policy_deleted=1,        "Bucket Policy Deleted")
+
+/* Score based on exposure type and whether write access is granted */
+| eval risk_score=0
+| eval risk_score=if(public_policy=1 AND match(policy_doc,"s3:PutObject"), risk_score+70, risk_score)
+| eval risk_score=if(public_acl=1 AND match(bucket_acl,"AllUsers"),        risk_score+60, risk_score)
+| eval risk_score=if(public_policy=1,                                      risk_score+50, risk_score)
+| eval risk_score=if(block_public_disabled=1,                              risk_score+40, risk_score)
+| eval risk_score=if(policy_deleted=1,                                     risk_score+35, risk_score)
+
+| stats
+    count                    AS event_count,
+    values(exposure_type)    AS exposure_types,
+    values(bucket_name)      AS buckets_exposed,
+    values(sourceIPAddress)  AS source_ips,
+    values(awsRegion)        AS regions,
+    min(_time)               AS first_seen,
+    max(_time)               AS last_seen
+    by actor, risk_score
+
+| eval alert_title="S3 Bucket Public Exposure: " . actor
+| table _time, alert_title, actor, exposure_types, buckets_exposed,
+        source_ips, regions, event_count, risk_score, first_seen, last_seen
+| sort -risk_score
+
+/*
+TUNING PARAMETERS:
+- Known public buckets: Maintain an exclusion list for intentionally public assets
+- Dev account suppression: Scope the rule to production account IDs only
+- policy_deleted severity: Reduce risk weight for policy deletions in sandbox accounts
+- Whitelist examples:
+  | where NOT match(bucket_name, "public-assets|static-web|cdn-|open-data")
+  | where NOT match(userIdentity.accountId, "<dev-account-id>|<sandbox-account-id>")
+
+FALSE POSITIVES:
+- Intentionally public S3 static website buckets (CloudFront origins, direct hosting)
+- Open-source distribution buckets or public artifact repositories
+- Development and sandbox accounts with intentionally relaxed policies
+- AWS CloudFormation deploying public bucket configurations as defined in templates
+
+RECOMMENDED RESPONSE:
+1. Immediately verify current bucket accessibility: aws s3api get-bucket-policy
+   and aws s3api get-bucket-acl to confirm exposure status
+2. Identify the data classification of the bucket contents
+3. Check if any objects were publicly accessed after the policy change (S3 access logs)
+4. Re-enable S3 Block Public Access and restore the restrictive policy immediately
+5. If data was accessed publicly, treat all bucket contents as potentially compromised
+6. Initiate data breach assessment if PII, PHI, or regulated data was exposed
+
+INVESTIGATION QUERIES:
+- Current bucket policy: | makeresults | eval cmd="aws s3api get-bucket-policy
+  --bucket <bucket_name>" (run via Lambda or Systems Manager for real-time check)
+- Public access after policy change: index=aws_s3_access bucket=<bucket_name>
+  httpStatus=200 requester="-" earliest=<first_seen> | stats count by key, remoteip
+- Actor activity before exposure: index=aws_cloudtrail sourcetype="aws:cloudtrail"
+  userIdentity.userName=<actor> earliest=-2h latest=<first_seen>
+  | table _time, eventName, requestParameters, sourceIPAddress
+
+DATA SOURCES REQUIRED:
+- AWS CloudTrail (management events, S3 management events)
+- S3 Server Access Logs (for post-exposure access detection)
+
+HIGH-RISK INDICATORS:
+- Exposure event followed immediately by high volume of anonymous GetObject requests
+- Policy grants s3:PutObject to Principal: * (write-accessible public bucket)
+- Actor made the change outside business hours or from an unknown IP
+- Bucket name contains keywords: backup, data, db, export, confidential, internal
+
+PREVENTION MEASURES:
+- Enable S3 Block Public Access at the AWS Organization and account level by default
+- Apply SCP: Deny s3:PutBucketPolicy if policy grants Principal "*"
+- Enable AWS Config rules: s3-bucket-public-read-prohibited, s3-bucket-public-write-prohibited
+- Set up Amazon Macie to classify and monitor sensitive data in S3
+
+RELATED TECHNIQUES:
+- T1619 - Cloud Storage Object Discovery
+- T1537 - Transfer Data to Cloud Account
+- T1078.004 - Valid Accounts: Cloud Accounts
+
+CHANGELOG:
+v1.0 (2026-02-17): Initial release
+*/

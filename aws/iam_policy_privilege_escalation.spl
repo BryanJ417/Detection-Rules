@@ -1,0 +1,132 @@
+/*
+Detection Rule: AWS IAM Privilege Escalation via Policy Attachment
+Author: Bryan Jorge
+MITRE ATT&CK: T1078.004 - Valid Accounts: Cloud Accounts
+              T1098.001 - Account Manipulation: Additional Cloud Credentials
+Severity: Critical
+Description: Detects when an IAM principal attaches a high-privilege managed
+policy, writes an inline policy granting admin-equivalent access, or adds a
+user to an admin group — particularly when targeting their own account. A
+principal with iam:AttachUserPolicy or iam:PutUserPolicy can silently elevate
+themselves to AdministratorAccess without creating new accounts, making this
+one of the stealthiest cloud privilege escalation paths.
+*/
+
+index=aws_cloudtrail sourcetype="aws:cloudtrail"
+    eventName IN (
+        "AttachUserPolicy", "AttachGroupPolicy", "AttachRolePolicy",
+        "PutUserPolicy", "PutGroupPolicy", "PutRolePolicy",
+        "CreatePolicyVersion", "AddUserToGroup"
+    )
+    errorCode=""
+
+| eval actor=coalesce(userIdentity.userName, userIdentity.principalId)
+| eval actor_arn=userIdentity.arn
+
+| eval target_entity=coalesce(
+    requestParameters.userName,
+    requestParameters.groupName,
+    requestParameters.roleName)
+
+| eval policy_arn=coalesce(
+    requestParameters.policyArn,
+    requestParameters.policyName)
+
+| eval policy_document=requestParameters.policyDocument
+
+/* Flag policies granting admin-level access */
+| eval is_admin_policy=if(
+    match(policy_arn, "AdministratorAccess|PowerUserAccess|IAMFullAccess") OR
+    match(policy_document, "\"Action\"\s*:\s*\"\*\"") OR
+    match(policy_document, "\"Effect\"\s*:\s*\"Allow\".*\"Resource\"\s*:\s*\"\*\""),
+    1, 0)
+
+/* Flag self-escalation — actor targeting their own identity */
+| eval is_self_escalation=if(
+    match(actor_arn, target_entity) OR actor=target_entity, 1, 0)
+
+| where is_admin_policy=1 OR is_self_escalation=1
+
+/* Score based on escalation type and privilege level */
+| eval risk_score=0
+| eval risk_score=if(is_admin_policy=1 AND is_self_escalation=1,   risk_score+70, risk_score)
+| eval risk_score=if(is_admin_policy=1 AND is_self_escalation=0,   risk_score+50, risk_score)
+| eval risk_score=if(is_self_escalation=1 AND is_admin_policy=0,   risk_score+40, risk_score)
+| eval risk_score=if(match(policy_arn, "AdministratorAccess"),      risk_score+20, risk_score)
+| eval risk_score=if(match(policy_arn, "IAMFullAccess"),            risk_score+15, risk_score)
+| eval risk_score=if(eventName="CreatePolicyVersion",               risk_score+10, risk_score)
+
+| stats
+    count                        AS event_count,
+    values(eventName)            AS escalation_actions,
+    values(policy_arn)           AS policies_attached,
+    values(target_entity)        AS target_entities,
+    values(sourceIPAddress)      AS source_ips,
+    values(awsRegion)            AS regions,
+    values(is_self_escalation)   AS self_escalation,
+    min(_time)                   AS first_seen,
+    max(_time)                   AS last_seen
+    by actor, is_admin_policy, risk_score
+
+| eval alert_title="Cloud Privilege Escalation via IAM Policy: " . actor
+| table _time, alert_title, actor, escalation_actions, policies_attached,
+        target_entities, self_escalation, source_ips, regions,
+        event_count, risk_score, first_seen, last_seen
+| sort -risk_score
+
+/*
+TUNING PARAMETERS:
+- policy_arn exclusions: Add known approved managed policies that trigger false positives
+- actor exclusions: Exclude IaC deployment roles that legitimately manage IAM
+- Whitelist examples:
+  | where NOT match(actor, "TerraformRole|CloudFormationRole|DeploymentPipeline")
+  | where NOT match(policy_arn, "ReadOnlyAccess|ViewOnlyAccess|SecurityAudit")
+- Time window: Suppress during approved maintenance windows using eval time conditions
+
+FALSE POSITIVES:
+- Terraform or CloudFormation pipelines creating IAM roles with administrative permissions
+- IT onboarding workflows granting access to new cloud administrator accounts
+- Legitimate IAM team provisioning admin roles as part of approved change requests
+- AWS Organizations automation creating standardized permission sets
+
+RECOMMENDED RESPONSE:
+1. Check for a change management ticket corresponding to this policy attachment
+2. Confirm whether the actor is authorized to manage IAM in this account
+3. Review what API actions the target entity has taken since receiving elevated access
+4. Immediately detach the unauthorized policy and disable the actor's credentials
+5. Implement IAM permission boundaries to cap maximum privileges for the affected role
+6. Conduct full IAM audit to identify any additional backdoor accounts or policies created
+
+INVESTIGATION QUERIES:
+- Actor's full IAM activity: index=aws_cloudtrail sourcetype="aws:cloudtrail"
+  eventSource="iam.amazonaws.com" userIdentity.userName=<actor> earliest=-48h
+  | table _time, eventName, requestParameters, sourceIPAddress
+- Target entity actions post-escalation: index=aws_cloudtrail sourcetype="aws:cloudtrail"
+  userIdentity.userName=<target> earliest=<first_seen> | table _time, eventName, requestParameters
+- Policy document review: index=aws_cloudtrail sourcetype="aws:cloudtrail"
+  eventName="PutUserPolicy" | eval doc=requestParameters.policyDocument | table _time, actor, doc
+
+DATA SOURCES REQUIRED:
+- AWS CloudTrail (management events, IAM data plane events)
+- IAM Access Analyzer for policy content analysis
+
+HIGH-RISK INDICATORS:
+- Actor and target entity are the same (self-escalation)
+- Policy grants Action: * on Resource: * (full administrator)
+- Event occurs outside business hours or from an unusual source IP
+- Actor's account shows recent geolocation anomaly (correlate with access_key_new_geolocation rule)
+
+PREVENTION MEASURES:
+- Enforce IAM permission boundaries on all user and role creation
+- Apply SCP: Deny iam:AttachUserPolicy unless the actor is in an approved admin group
+- Enable AWS Config rule: iam-policy-no-statements-with-admin-access
+- Use AWS IAM Access Analyzer to continuously audit overly permissive policies
+
+RELATED TECHNIQUES:
+- T1548.005 - Temporary Elevated Cloud Access
+- T1136.003 - Create Account: Cloud Account
+- T1098.003 - Account Manipulation: Additional Cloud Roles
+
+CHANGELOG:
+v1.0 (2026-02-17): Initial release
+*/

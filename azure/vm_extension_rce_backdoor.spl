@@ -1,0 +1,137 @@
+/*
+Detection Rule: Azure VM Extension Installed for Remote Code Execution
+Author: Bryan Jorge
+MITRE ATT&CK: T1059.004 - Command and Scripting Interpreter: Unix Shell
+              T1546 - Event Triggered Execution
+              T1505 - Server Software Component
+Severity: Critical
+Description: Detects the installation of VM extensions that can execute arbitrary
+code on Azure virtual machines. VM extensions are a common attacker persistence
+technique after gaining Azure subscription access — they provide durable RCE even
+if the VM is rebooted, and run as SYSTEM/root. CustomScriptExtension, VMAccess,
+and RunCommand extensions are the highest-risk types as they execute attacker-
+controlled code or reset credentials directly on the machine.
+*/
+
+index=azure_activity sourcetype="azure:activity"
+    operationName="Microsoft.Compute/virtualMachines/extensions/write"
+    resultType="Success"
+
+| eval actor=coalesce(caller, properties.caller, "unknown")
+| eval vm_name=mvindex(split(resourceId, "/"), 8)
+| eval resource_group=mvindex(split(resourceId, "/"), 4)
+| eval subscription_id=mvindex(split(resourceId, "/"), 2)
+| eval extension_name=mvindex(split(resourceId, "/"), -1)
+| eval extension_type=spath(properties, "requestBody.properties.type")
+| eval extension_publisher=spath(properties, "requestBody.properties.publisher")
+| eval script_uri=spath(properties, "requestBody.properties.settings.fileUris")
+| eval command_run=spath(properties, "requestBody.properties.settings.commandToExecute")
+| eval has_protected_settings=if(
+    isnotnull(spath(properties, "requestBody.properties.protectedSettings")), 1, 0)
+
+/* Flag high-risk extension types capable of RCE or credential reset */
+| eval is_rce_type=if(match(extension_type,
+    "CustomScriptExtension|CustomScript|RunCommand|" .
+    "VMAccessAgent|VMAccess|PowerShell|WindowsPowerShellDSC"),
+    1, 0)
+
+/* Flag scripts loaded from external (non-blob) URIs */
+| eval is_external_script=if(
+    isnotnull(script_uri) AND
+    NOT match(script_uri, "blob\.core\.windows\.net"),
+    1, 0)
+
+/* Flag obfuscated commands commonly used to hide malicious payloads */
+| eval is_obfuscated=if(
+    match(command_run, "base64|iex |invoke-expression|-enc |-encoded|bypass|hidden"),
+    1, 0)
+
+| where is_rce_type=1 OR is_external_script=1
+
+/* Score based on extension type, script origin, and obfuscation */
+| eval risk_score=0
+| eval risk_score=if(is_obfuscated=1 AND is_external_script=1,                  risk_score+70, risk_score)
+| eval risk_score=if(is_external_script=1 AND is_rce_type=1,                    risk_score+60, risk_score)
+| eval risk_score=if(is_obfuscated=1 AND is_rce_type=1,                         risk_score+55, risk_score)
+| eval risk_score=if(match(extension_type, "VMAccessAgent|VMAccess"),            risk_score+50, risk_score)
+| eval risk_score=if(is_external_script=1,                                       risk_score+40, risk_score)
+| eval risk_score=if(is_rce_type=1,                                              risk_score+25, risk_score)
+| eval risk_score=if(has_protected_settings=1,                                   risk_score+10, risk_score)
+
+| stats
+    count                        AS install_count,
+    values(extension_type)       AS extension_types,
+    values(extension_name)       AS extension_names,
+    values(vm_name)              AS affected_vms,
+    values(resource_group)       AS resource_groups,
+    values(script_uri)           AS script_sources,
+    values(command_run)          AS commands,
+    values(sourceIPAddress)      AS actor_ips,
+    min(_time)                   AS first_seen,
+    max(_time)                   AS last_seen
+    by actor, subscription_id, is_external_script, is_obfuscated, risk_score
+
+| eval alert_title="Azure VM Extension RCE Backdoor Detected: " . actor
+| table _time, alert_title, actor, extension_types, affected_vms,
+        resource_groups, script_sources, commands, is_external_script,
+        is_obfuscated, actor_ips, install_count, risk_score, first_seen, last_seen
+| sort -risk_score
+
+/*
+TUNING PARAMETERS:
+- extension_type whitelist: Add approved agent types to reduce noise from monitoring
+  deployments (Log Analytics, Defender agents are commonly auto-deployed)
+- is_external_script: Remove this condition if your org loads scripts from external CDNs
+- Whitelist examples:
+  | where NOT match(actor, "AzureAutomation|MicrosoftDefenderForCloud|AzurePolicy")
+  | where NOT match(extension_type, "MicrosoftMonitoringAgent|OmsAgentForLinux|
+    AzureMonitorLinuxAgent|DependencyAgentLinux")
+
+FALSE POSITIVES:
+- Azure Automation State Configuration deploying DSC configurations to managed VMs
+- IT operations teams running CustomScript for approved patch or config deployment
+- Azure Security Center / Defender for Servers auto-provisioning monitoring agents
+- Packer or Terraform builds that install software via custom script during image creation
+
+RECOMMENDED RESPONSE:
+1. Verify whether the actor was authorized to install extensions on these VMs
+2. Examine script URI content and command_run value for malicious indicators
+3. Determine if this matches a scheduled automation runbook or change request
+4. Remove the malicious extension: az vm extension delete --name <ext> --vm-name <vm>
+5. Isolate the VM by applying a deny-all NSG rule to its NIC
+6. Rotate SSH keys and local admin credentials for all affected VMs
+
+INVESTIGATION QUERIES:
+- Extension install history on affected VM: index=azure_activity
+  operationName="Microsoft.Compute/virtualMachines/extensions/write"
+  resourceId=*<vm_name>* | table _time, caller, properties
+- Process activity via Defender (if Defender for Endpoint enrolled):
+  DeviceProcessEvents | where DeviceName=~"<vm_name>" | project Timestamp, FileName,
+  ProcessCommandLine, AccountName | order by Timestamp desc
+- Network connections from VM: index=azure_nsg sourceIPAddress=<vm_ip> earliest=<first_seen>
+  | stats count by destinationIPAddress, destinationPort, flowState
+
+DATA SOURCES REQUIRED:
+- Azure Activity Logs (ARM layer — extension write operations are captured here)
+- Optional: Microsoft Defender for Endpoint logs for process-level correlation
+
+HIGH-RISK INDICATORS:
+- Script loaded from an external IP (not blob.core.windows.net) or unknown domain
+- Command contains base64-encoded content (-enc flag, pipe to base64 -d)
+- VMAccess extension used to reset SSH keys or local admin password (credential reset)
+- Extension installed on multiple VMs across different resource groups simultaneously
+
+PREVENTION MEASURES:
+- Apply Azure Policy to restrict allowed VM extension publishers to an approved list
+- Enforce Just-In-Time VM access to block ad-hoc extension installation by default
+- Enable Microsoft Defender for Servers to detect malicious extension behavior at runtime
+- Require approval via Azure DevOps or change management for all VM extension deployments
+
+RELATED TECHNIQUES:
+- T1078.004 - Valid Accounts: Cloud Accounts
+- T1098 - Account Manipulation
+- T1053.003 - Scheduled Task/Job: Cron (persistence via user data / cloud-init)
+
+CHANGELOG:
+v1.0 (2026-02-17): Initial release
+*/

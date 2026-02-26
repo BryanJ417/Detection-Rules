@@ -1,0 +1,116 @@
+/*
+Detection Rule: AWS Cross-Account Role Assumption Chaining
+Author: Bryan Jorge
+MITRE ATT&CK: T1548.005 - Abuse Elevation Control: Temporary Elevated Cloud Access
+              T1078.004 - Valid Accounts: Cloud Accounts
+Severity: High
+Description: Detects role assumption chains where a principal assumes one role
+then uses that role to assume another — especially across account boundaries.
+Attackers use chaining to pivot from a low-privilege initial foothold to a
+highly privileged role in a target account while obscuring the original identity.
+This rule flags 3 or more AssumeRole calls within a 10-minute window, or any
+AssumedRole-type principal making cross-account role assumptions.
+*/
+
+index=aws_cloudtrail sourcetype="aws:cloudtrail"
+    eventName="AssumeRole"
+    errorCode=""
+
+| eval actor=coalesce(userIdentity.userName, userIdentity.principalId)
+| eval actor_account=userIdentity.accountId
+| eval actor_type=userIdentity.type
+| eval assumed_role_arn=requestParameters.roleArn
+| eval session_name=requestParameters.roleSessionName
+| eval assumed_account=mvindex(split(assumed_role_arn, ":"), 4)
+
+| eval is_cross_account=if(actor_account!=assumed_account, 1, 0)
+
+/* Aggregate over 10-minute windows to catch rapid chaining */
+| bin _time span=10m
+| stats
+    count                        AS assume_count,
+    dc(assumed_role_arn)         AS distinct_roles,
+    dc(assumed_account)          AS distinct_accounts,
+    values(assumed_role_arn)     AS roles_assumed,
+    values(assumed_account)      AS target_accounts,
+    values(session_name)         AS session_names,
+    values(sourceIPAddress)      AS source_ips,
+    sum(is_cross_account)        AS cross_account_hops,
+    min(_time)                   AS first_seen,
+    max(_time)                   AS last_seen
+    by actor, actor_type, actor_account, _time
+
+| where assume_count >= 3 OR (cross_account_hops >= 1 AND actor_type="AssumedRole")
+
+/* Score based on chain depth, account spread, and actor type */
+| eval risk_score=0
+| eval risk_score=if(assume_count >= 5 AND distinct_accounts >= 2,  risk_score+60, risk_score)
+| eval risk_score=if(assume_count >= 3 AND distinct_accounts >= 2,  risk_score+40, risk_score)
+| eval risk_score=if(cross_account_hops >= 1 AND actor_type="AssumedRole", risk_score+35, risk_score)
+| eval risk_score=if(assume_count >= 3 AND distinct_accounts < 2,   risk_score+20, risk_score)
+| eval risk_score=if(match(session_names, "^[a-z0-9]{8,}$"),        risk_score+10, risk_score)
+
+| eval alert_title="Role Assumption Chain Detected: " . actor
+| table _time, alert_title, actor, actor_type, actor_account,
+        assume_count, distinct_roles, distinct_accounts,
+        roles_assumed, target_accounts, session_names,
+        cross_account_hops, source_ips, risk_score, first_seen, last_seen
+| sort -risk_score
+
+/*
+TUNING PARAMETERS:
+- assume_count threshold: Raise to 5 in large environments with complex CI/CD pipelines
+- cross_account_hops: Remove the AssumedRole condition if your org uses federated roles heavily
+- Time window span: Widen to 30m if your pipelines perform sequential role assumptions slowly
+- Whitelist examples:
+  | where NOT match(actor, "CodePipeline|GitHubActions|JenkinsRole|TerraformCloud")
+  | where NOT match(assumed_role_arn, "arn:aws:iam::<known-mgmt-account>")
+
+FALSE POSITIVES:
+- CI/CD pipelines assuming multiple roles for multi-environment deployments (dev→staging→prod)
+- AWS Organizations management account tools reading across member accounts
+- Security tooling (Config aggregator, Security Hub, GuardDuty master) performing multi-account reads
+- AWS SSO/IAM Identity Center session vending across accounts
+
+RECOMMENDED RESPONSE:
+1. Map the full assumption chain — trace actor → role1 → role2 → final target role
+2. Identify the originating identity and confirm it is authorized for cross-account access
+3. Determine what API actions were performed under each assumed role session
+4. If confirmed malicious: revoke all STS tokens via aws sts revoke-session
+5. Restrict the abused role's trust policy to specific, approved source ARNs
+6. Audit all API activity across every account in the chain for data access or changes
+
+INVESTIGATION QUERIES:
+- Full session API calls: index=aws_cloudtrail sourcetype="aws:cloudtrail"
+  userIdentity.principalId=<actor> earliest=<first_seen> latest=<last_seen>
+  | table _time, eventName, awsRegion, sourceIPAddress, requestParameters
+- Actions under final assumed role: index=aws_cloudtrail sourcetype="aws:cloudtrail"
+  userIdentity.sessionContext.sessionIssuer.arn=<final_role_arn> earliest=-2h
+  | table _time, eventName, requestParameters
+- Session name analysis: index=aws_cloudtrail sourcetype="aws:cloudtrail"
+  eventName="AssumeRole" requestParameters.roleSessionName=<session_name>
+  | table _time, userIdentity.arn, requestParameters.roleArn, sourceIPAddress
+
+DATA SOURCES REQUIRED:
+- AWS CloudTrail (management events) — all regions and all accounts in the organization
+
+HIGH-RISK INDICATORS:
+- Session names are generic (random strings, timestamps) rather than descriptive pipeline names
+- Final assumed role has AdministratorAccess or IAMFullAccess
+- Source IP changes between assumption hops (attacker relaying through compromised instances)
+- Assumptions occur outside normal business hours for the originating account
+
+PREVENTION MEASURES:
+- Add aws:PrincipalArn conditions to role trust policies to restrict assumption sources
+- Enable STS regional endpoints and disable global STS endpoint where possible
+- Set maximum session duration on roles to limit the window of stolen token validity
+- Implement AWS Config rule to alert on new cross-account trust relationships
+
+RELATED TECHNIQUES:
+- T1078.004 - Valid Accounts: Cloud Accounts
+- T1550.001 - Use Alternate Authentication Material: Application Access Token
+- T1619 - Cloud Storage Object Discovery
+
+CHANGELOG:
+v1.0 (2026-02-17): Initial release
+*/

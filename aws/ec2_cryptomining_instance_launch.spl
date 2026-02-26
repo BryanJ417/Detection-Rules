@@ -1,0 +1,125 @@
+/*
+Detection Rule: AWS EC2 Resource Hijacking for Cryptomining
+Author: Bryan Jorge
+MITRE ATT&CK: T1496 - Resource Hijacking
+Severity: High
+Description: Detects the launch of EC2 instances using GPU-optimized or
+compute-intensive instance types commonly used for cryptomining (p3, p4,
+g4, g5 families), or mass instance launches by a single principal across
+multiple regions within a short window. Resource hijacking is one of the
+most financially damaging outcomes of AWS credential theft — attackers
+can accumulate thousands of dollars in charges within hours.
+*/
+
+index=aws_cloudtrail sourcetype="aws:cloudtrail"
+    eventSource="ec2.amazonaws.com"
+    eventName="RunInstances"
+    errorCode=""
+
+| eval actor=coalesce(userIdentity.userName, userIdentity.principalId)
+| eval instance_type=requestParameters.instanceType
+| eval instance_count=coalesce(requestParameters.maxCount, 1)
+| eval ami_id=requestParameters.imageId
+| eval key_pair=requestParameters.keyName
+
+/* Classify instance families by mining potential */
+| eval is_gpu_instance=if(
+    match(instance_type, "^p2|^p3|^p4|^g3|^g4|^g5|^gr6"), 1, 0)
+
+| eval is_compute_heavy=if(
+    match(instance_type, "^c5n|^c6in|^hpc|^x2|^u-"), 1, 0)
+
+| eval is_mining_candidate=if(
+    is_gpu_instance=1 OR is_compute_heavy=1, 1, 0)
+
+/* Aggregate over 1-hour windows per actor */
+| bin _time span=1h
+| stats
+    sum(instance_count)      AS total_instances,
+    count                    AS launch_events,
+    dc(awsRegion)            AS distinct_regions,
+    values(instance_type)    AS instance_types,
+    values(awsRegion)        AS regions,
+    values(ami_id)           AS amis_used,
+    values(sourceIPAddress)  AS source_ips,
+    max(is_mining_candidate) AS mining_type_detected,
+    min(_time)               AS first_seen,
+    max(_time)               AS last_seen
+    by actor, _time
+
+| where mining_type_detected=1
+    OR total_instances >= 10
+    OR (distinct_regions >= 3 AND total_instances >= 5)
+
+/* Score based on instance type, volume, and geographic spread */
+| eval risk_score=0
+| eval risk_score=if(mining_type_detected=1 AND distinct_regions >= 3, risk_score+65, risk_score)
+| eval risk_score=if(mining_type_detected=1 AND total_instances >= 5,  risk_score+50, risk_score)
+| eval risk_score=if(total_instances >= 20 AND distinct_regions >= 2,  risk_score+55, risk_score)
+| eval risk_score=if(mining_type_detected=1,                           risk_score+35, risk_score)
+| eval risk_score=if(total_instances >= 10,                            risk_score+25, risk_score)
+| eval risk_score=if(distinct_regions >= 3,                            risk_score+15, risk_score)
+
+| eval alert_title="EC2 Resource Hijacking / Cryptomining Suspected: " . actor
+| table _time, alert_title, actor, total_instances, launch_events,
+        distinct_regions, instance_types, regions, amis_used,
+        source_ips, mining_type_detected, risk_score, first_seen, last_seen
+| sort -risk_score
+
+/*
+TUNING PARAMETERS:
+- total_instances threshold: Raise to 20 in environments with active autoscaling
+- distinct_regions threshold: Raise if your org legitimately deploys to 3+ regions
+- mining_type_detected filter: Add | where mining_type_detected=1 to limit to
+  confirmed GPU/compute types only and eliminate volume-based false positives
+- Whitelist examples:
+  | where NOT match(actor, "SageMakerRole|MLTrainingRole|HPCRole|RenderFarm")
+  | where NOT match(instance_types, "^t|^m|^r")
+
+FALSE POSITIVES:
+- ML/AI workloads legitimately using GPU instances for SageMaker training jobs
+- HPC research workloads using compute-intensive instances for simulation
+- Autoscaling events triggered by legitimate application load spikes
+- Rendering pipelines (VFX, media) using GPU fleets for production work
+
+RECOMMENDED RESPONSE:
+1. Identify the launched instances and verify current state (running/stopped)
+2. Confirm whether the actor has a legitimate business need for these instance types
+3. Check running processes on suspicious instances via Systems Manager Session Manager
+4. If mining confirmed: terminate all instances and disable actor's IAM credentials
+5. Apply SCP to restrict GPU instance types in non-approved accounts
+6. Audit AWS billing for unexpected charges and initiate cost dispute if warranted
+
+INVESTIGATION QUERIES:
+- All instances launched by actor: index=aws_cloudtrail sourcetype="aws:cloudtrail"
+  eventName="RunInstances" userIdentity.userName=<actor> earliest=-24h
+  | table _time, requestParameters.instanceType, requestParameters.maxCount, awsRegion
+- Running process check (via Systems Manager): requires SSM Agent on instance
+  aws ssm send-command --document-name AWS-RunShellScript --parameters
+  '{"commands":["ps aux | grep -E \"xmrig|cgminer|ethminer|monero\""]}' --instance-ids <id>
+- Cost spike check: index=aws_billing earliest=-7d | stats sum(UnblendedCost) by LinkedAccountId, ServiceCode
+
+DATA SOURCES REQUIRED:
+- AWS CloudTrail (management events) — all active regions
+- AWS Cost and Usage Reports (for billing anomaly correlation)
+
+HIGH-RISK INDICATORS:
+- Instances launched across 3+ regions simultaneously (maximizing hash rate)
+- AMI ID is not from the organization's approved AMI catalog
+- No key pair specified (instances may be controlled via user data script with embedded key)
+- Actor's credentials were recently used from an anomalous geolocation
+
+PREVENTION MEASURES:
+- Set AWS Service Quotas to limit GPU instance counts to approved maximums
+- Enable AWS Cost Anomaly Detection with threshold alerts for daily spend
+- Apply SCP: Deny RunInstances for p*/g*/c5n* instance types in non-production accounts
+- Enable GuardDuty: CryptoCurrency:EC2/BitcoinTool.B!DNS finding
+
+RELATED TECHNIQUES:
+- T1078.004 - Valid Accounts: Cloud Accounts
+- T1552.005 - Cloud Instance Metadata API
+- T1059 - Command and Scripting Interpreter (via user data scripts)
+
+CHANGELOG:
+v1.0 (2026-02-17): Initial release
+*/

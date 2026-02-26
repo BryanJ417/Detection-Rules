@@ -1,0 +1,105 @@
+/*
+Detection Rule: AWS IAM Access Key Used from New Geolocation
+Author: Bryan Jorge
+MITRE ATT&CK: T1078.004 - Valid Accounts: Cloud Accounts
+Severity: High
+Description: Detects when an IAM access key authenticates from a country not
+observed in a 30-day baseline for that principal. Attackers who steal access
+keys frequently operate from different geolocations than the legitimate owner.
+High-confidence signal when combined with sensitive API actions (AssumeRole,
+GetSecretValue, CreateUser) performed during the anomalous session.
+*/
+
+index=aws_cloudtrail sourcetype="aws:cloudtrail"
+    (eventSource="signin.amazonaws.com" OR eventSource="sts.amazonaws.com")
+    (errorCode="" OR errorCode="Success")
+
+| eval principal=coalesce(userIdentity.userName, userIdentity.principalId)
+| eval current_country=geoip(sourceIPAddress, "country")
+
+/* Build 30-day baseline of observed countries per principal */
+| appendcols
+    [search index=aws_cloudtrail sourcetype="aws:cloudtrail" earliest=-30d@d latest=-1h
+        (eventSource="signin.amazonaws.com" OR eventSource="sts.amazonaws.com")
+        (errorCode="" OR errorCode="Success")
+    | eval principal=coalesce(userIdentity.userName, userIdentity.principalId)
+    | eval hist_country=geoip(sourceIPAddress, "country")
+    | stats values(hist_country) AS known_countries by principal]
+
+/* Flag access from countries outside the 30-day baseline */
+| where NOT match(known_countries, current_country)
+| where isnotnull(current_country) AND current_country!="unknown"
+
+/* Score based on what API actions were performed from the new location */
+| eval risk_score=0
+| eval risk_score=if(match(eventName,
+    "AssumeRole|CreateUser|AttachUserPolicy|PutUserPolicy"),  risk_score+50, risk_score)
+| eval risk_score=if(match(eventName,
+    "GetSecretValue|GetParameter|ListBuckets"),               risk_score+30, risk_score)
+| eval risk_score=if(match(eventName,
+    "DescribeInstances|ListRoles|ListUsers"),                 risk_score+15, risk_score)
+| eval risk_score=if(risk_score=0,                           risk_score+10, risk_score)
+
+| stats
+    count                   AS event_count,
+    values(sourceIPAddress) AS source_ips,
+    values(eventName)       AS api_actions,
+    values(awsRegion)       AS regions,
+    min(_time)              AS first_seen,
+    max(_time)              AS last_seen
+    by principal, current_country, known_countries, risk_score
+
+| eval alert_title="IAM Access Key Used from New Geolocation: " . principal
+| table _time, alert_title, principal, current_country, known_countries,
+        source_ips, api_actions, regions, event_count, risk_score, first_seen, last_seen
+| sort -risk_score
+
+/*
+TUNING PARAMETERS:
+- Baseline window: Change earliest=-30d to earlier (e.g., -60d) for new accounts
+  or accounts with infrequent access patterns
+- risk_score threshold: Add | where risk_score >= 30 to suppress low-signal logins
+- Whitelist examples:
+  | where NOT match(principal, "svc-|automation-|pipeline-|github-actions")
+  | where NOT match(current_country, "US|GB|DE|CA")
+
+FALSE POSITIVES:
+- Developers or admins traveling internationally on business
+- Cloud accounts accessed via corporate VPN with exit nodes in multiple countries
+- Automated pipelines (GitHub Actions, GitLab CI) running from cloud-hosted runners
+  in different regions
+
+RECOMMENDED RESPONSE:
+1. Confirm the principal identity — is this a human user or a service account?
+2. Contact the user or team to verify if travel or VPN change explains the new location
+3. Review all API actions taken during the anomalous session for sensitive operations
+4. If confirmed malicious: disable the access key immediately via IAM console
+5. Rotate all access keys for the affected principal and revoke active STS sessions
+6. Audit Secrets Manager, Parameter Store, and IAM for any changes made during session
+
+INVESTIGATION QUERIES:
+- Full session activity: index=aws_cloudtrail sourcetype="aws:cloudtrail"
+  userIdentity.userName=<principal> earliest=-24h | table _time, eventName, sourceIPAddress, requestParameters
+- Sensitive API actions: index=aws_cloudtrail sourcetype="aws:cloudtrail"
+  userIdentity.userName=<principal> eventName IN ("GetSecretValue","CreateUser","AttachUserPolicy")
+  | table _time, eventName, sourceIPAddress, requestParameters
+- IP reputation check: | makeresults | eval ip="<source_ip>" | iplocation ip
+  | table Country, Region, City, lat, lon
+
+DATA SOURCES REQUIRED:
+- AWS CloudTrail (management events) — enabled in all active regions
+- Splunk geoip lookup or Maxmind GeoIP database for country resolution
+
+PREVENTION MEASURES:
+- Apply IAM condition keys (aws:SourceIp) to restrict API access to corporate IP ranges
+- Enforce MFA for all IAM user console logins
+- Enable AWS GuardDuty: UnauthorizedAccess:IAMUser/ConsoleLoginSuccess.B finding
+
+RELATED TECHNIQUES:
+- T1078 - Valid Accounts (parent technique)
+- T1539 - Steal Web Session Cookie
+- T1552.005 - Unsecured Credentials: Cloud Instance Metadata API
+
+CHANGELOG:
+v1.0 (2026-02-17): Initial release
+*/

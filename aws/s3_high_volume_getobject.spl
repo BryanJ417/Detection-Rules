@@ -1,0 +1,124 @@
+/*
+Detection Rule: AWS S3 High-Volume GetObject Data Exfiltration
+Author: Bryan Jorge
+MITRE ATT&CK: T1530 - Data from Cloud Storage
+Severity: High
+Description: Detects bulk S3 GetObject activity that may indicate data
+exfiltration. Attackers with valid credentials will often enumerate and
+download large volumes of objects in a short window. This rule flags
+principals exceeding download count or volume thresholds, and increases
+severity when data flows to external IP addresses. Requires S3 data
+event logging enabled in CloudTrail (not enabled by default).
+*/
+
+index=aws_cloudtrail sourcetype="aws:cloudtrail"
+    eventSource="s3.amazonaws.com"
+    eventName="GetObject"
+    errorCode=""
+
+| eval actor=coalesce(userIdentity.userName, userIdentity.principalId)
+| eval bucket_name=requestParameters.bucketName
+| eval object_key=requestParameters.key
+| eval bytes_out=coalesce(additionalEventData.bytesTransferredOut, 0)
+
+| eval ip_class=case(
+    match(sourceIPAddress, "^10\.|^172\.(1[6-9]|2\d|3[01])\.|^192\.168\."), "internal",
+    match(sourceIPAddress, "amazonaws\.com"),                                 "aws_service",
+    1==1,                                                                     "external")
+
+/* Aggregate per actor per 15-minute window */
+| bin _time span=15m
+| stats
+    count                    AS get_count,
+    dc(bucket_name)          AS distinct_buckets,
+    dc(object_key)           AS distinct_objects,
+    sum(bytes_out)           AS total_bytes,
+    values(bucket_name)      AS buckets_accessed,
+    values(sourceIPAddress)  AS source_ips,
+    values(ip_class)         AS ip_classes,
+    min(_time)               AS first_seen,
+    max(_time)               AS last_seen
+    by actor, _time
+
+| eval total_mb=round(total_bytes / 1048576, 2)
+
+| where get_count > 500
+    OR distinct_buckets > 5
+    OR (total_mb > 1000 AND match(ip_classes, "external"))
+    OR (get_count > 100 AND match(ip_classes, "external"))
+
+/* Score based on volume, destination, and bucket spread */
+| eval risk_score=0
+| eval risk_score=if(total_mb > 5000 AND match(ip_classes,"external"),   risk_score+60, risk_score)
+| eval risk_score=if(get_count > 1000 AND match(ip_classes,"external"),  risk_score+50, risk_score)
+| eval risk_score=if(total_mb > 1000 AND match(ip_classes,"external"),   risk_score+40, risk_score)
+| eval risk_score=if(distinct_buckets > 10,                              risk_score+25, risk_score)
+| eval risk_score=if(get_count > 500,                                    risk_score+15, risk_score)
+| eval risk_score=if(match(ip_classes,"external"),                       risk_score+10, risk_score)
+
+| eval alert_title="S3 Data Exfiltration Suspected: " . actor
+| table _time, alert_title, actor, get_count, distinct_buckets,
+        distinct_objects, total_mb, buckets_accessed,
+        source_ips, ip_classes, risk_score, first_seen, last_seen
+| sort -risk_score
+
+/*
+TUNING PARAMETERS:
+- get_count threshold: Run in search mode for 2 weeks first; set threshold at
+  mean + 2 standard deviations for your environment's baseline
+- total_mb threshold: Adjust based on typical ETL workload volumes
+- ip_class filter: Add | where match(ip_classes,"external") to alert only on
+  external destinations (eliminates most ETL pipeline false positives)
+- Whitelist examples:
+  | where NOT match(actor, "ETLRole|BackupRole|DataSync|GlueRole|SageMakerRole")
+  | where NOT match(buckets_accessed, "public-assets|static-website|open-data")
+
+FALSE POSITIVES:
+- ETL pipelines performing bulk reads for analytics or machine learning workloads
+- Cross-region S3 replication jobs triggered by policy changes
+- AWS Backup, DataSync, or third-party backup tools reading large object sets
+- Batch processing jobs (AWS Batch, Glue) reading full dataset partitions
+
+RECOMMENDED RESPONSE:
+1. Identify the actor type — is this a human user, service role, or pipeline?
+2. Cross-reference source IPs against known corporate, vendor, and cloud runner IPs
+3. Assess the data classification of the buckets accessed (PII, financial, IP)
+4. If malicious: disable the actor's IAM credentials and apply explicit S3 deny policy
+5. Apply S3 Block Public Access and restrict GetObject to specific VPC endpoints
+6. Notify data governance team if sensitive data volumes were transferred externally
+
+INVESTIGATION QUERIES:
+- List all objects downloaded: index=aws_cloudtrail sourcetype="aws:cloudtrail"
+  eventName="GetObject" userIdentity.userName=<actor> earliest=<first_seen>
+  | stats count by requestParameters.bucketName, requestParameters.key
+- Confirm external egress: index=aws_cloudtrail sourcetype="aws:cloudtrail"
+  eventName="GetObject" userIdentity.userName=<actor>
+  | eval country=geoip(sourceIPAddress,"country") | stats count by country, sourceIPAddress
+- Post-access IAM activity: index=aws_cloudtrail sourcetype="aws:cloudtrail"
+  userIdentity.userName=<actor> eventSource="iam.amazonaws.com"
+  | table _time, eventName, requestParameters
+
+DATA SOURCES REQUIRED:
+- AWS CloudTrail with S3 data events enabled (NOT enabled by default)
+  Enable via: CloudTrail > Trail > Data Events > S3 > Log all events
+
+HIGH-RISK INDICATORS:
+- Source IP resolves to a residential ISP, VPN provider, or Tor exit node
+- Actor's credentials were recently used from a new geolocation (correlate with
+  access_key_new_geolocation rule)
+- Downloads follow an enumeration pattern: ListBuckets → ListObjects → GetObject
+
+PREVENTION MEASURES:
+- Restrict S3 access via VPC endpoint policies to block external egress
+- Enable S3 Block Public Access at the account level
+- Enable Amazon Macie for automatic sensitive data discovery and alerting
+- Apply SCP to restrict s3:GetObject to approved VPC endpoints organization-wide
+
+RELATED TECHNIQUES:
+- T1619 - Cloud Storage Object Discovery
+- T1078.004 - Valid Accounts: Cloud Accounts
+- T1537 - Transfer Data to Cloud Account
+
+CHANGELOG:
+v1.0 (2026-02-17): Initial release
+*/

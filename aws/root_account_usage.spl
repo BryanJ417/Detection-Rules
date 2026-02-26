@@ -1,0 +1,97 @@
+/*
+Detection Rule: AWS Root Account Console or API Usage
+Author: Bryan Jorge
+MITRE ATT&CK: T1078.004 - Valid Accounts: Cloud Accounts
+Severity: Critical
+Description: Detects any use of the AWS root account via console login or
+programmatic API calls. Root account usage should be near-zero in a
+well-managed AWS environment. Any activity — even a single event — warrants
+immediate investigation. AWS best practice mandates root is used only for
+initial setup and specific billing tasks that cannot be delegated.
+*/
+
+index=aws_cloudtrail sourcetype="aws:cloudtrail"
+    userIdentity.type="Root"
+
+| eval event_type=case(
+    eventName="ConsoleLogin",                      "Console Login",
+    eventSource="signin.amazonaws.com",            "Sign-In Event",
+    1==1,                                          "API Call")
+
+| eval mfa_used=coalesce(additionalEventData.MFAUsed, "No")
+
+/* Score based on action sensitivity and MFA posture */
+| eval risk_score=0
+| eval risk_score=if(event_type="Console Login" AND mfa_used="No",  risk_score+60, risk_score)
+| eval risk_score=if(event_type="Console Login" AND mfa_used="Yes", risk_score+40, risk_score)
+| eval risk_score=if(match(eventName,
+    "CreateUser|DeleteUser|AttachUserPolicy|CreateAccessKey"),       risk_score+30, risk_score)
+| eval risk_score=if(match(eventName,
+    "DeleteBucket|PutBucketPolicy|PutBucketAcl"),                   risk_score+25, risk_score)
+| eval risk_score=if(event_type="API Call",                         risk_score+10, risk_score)
+
+| where risk_score > 0
+
+| stats
+    count                   AS event_count,
+    values(eventName)       AS api_actions,
+    values(sourceIPAddress) AS source_ips,
+    values(awsRegion)       AS regions,
+    values(mfa_used)        AS mfa_status,
+    values(event_type)      AS event_types,
+    min(_time)              AS first_seen,
+    max(_time)              AS last_seen
+    by userIdentity.type, risk_score
+
+| eval alert_title="CRITICAL: AWS Root Account Activity Detected"
+| table _time, alert_title, event_types, mfa_status, source_ips,
+        api_actions, regions, event_count, risk_score, first_seen, last_seen
+| sort -risk_score
+
+/*
+TUNING PARAMETERS:
+- risk_score threshold: Lower scores (>10) catch read-only root API calls; raise
+  to >40 if you want only console logins and destructive actions to alert
+- mfa_used filter: Remove the MFA scoring if MFA is not yet enforced to reduce noise
+- Whitelist examples:
+  | where NOT match(eventName, "^GetAccount|^ListAccount|DescribeBillingView")
+
+FALSE POSITIVES:
+- Quarterly billing reviews performed by the finance team via root login
+- Break-glass emergency access during a major outage (should have a change ticket)
+- Initial AWS account setup activities in newly provisioned accounts
+- Automated billing or cost-management tools that use root-level APIs
+
+RECOMMENDED RESPONSE:
+1. Confirm whether a change management ticket exists for this root activity
+2. Identify the source IP and determine if it belongs to corporate infrastructure
+3. Review all API actions taken during the root session in CloudTrail
+4. If unauthorized: immediately rotate root credentials and revoke active sessions
+5. Enable or verify hardware MFA is enforced on the root account
+6. Document findings, close the incident, and trigger a root-cause review
+
+INVESTIGATION QUERIES:
+- All root activity in last 24h: index=aws_cloudtrail sourcetype="aws:cloudtrail"
+  userIdentity.type="Root" earliest=-24h | table _time, eventName, sourceIPAddress, awsRegion
+- IAM changes during session: index=aws_cloudtrail sourcetype="aws:cloudtrail"
+  userIdentity.type="Root" eventSource="iam.amazonaws.com" | table _time, eventName, requestParameters
+- S3 changes during session: index=aws_cloudtrail sourcetype="aws:cloudtrail"
+  userIdentity.type="Root" eventSource="s3.amazonaws.com" | table _time, eventName, requestParameters
+
+DATA SOURCES REQUIRED:
+- AWS CloudTrail (management events) — must be enabled in all active regions
+
+PREVENTION MEASURES:
+- Enforce hardware MFA token on root account (cannot be delegated)
+- Lock root credentials in a physical or enterprise vault (CyberArk, 1Password)
+- Enable AWS Config rule: root-account-mfa-enabled
+- Set AWS Organizations SCP alert on root usage across all member accounts
+
+RELATED TECHNIQUES:
+- T1078 - Valid Accounts (parent technique)
+- T1548 - Abuse Elevation Control Mechanism
+- T1098.001 - Account Manipulation: Additional Cloud Credentials
+
+CHANGELOG:
+v1.0 (2026-02-17): Initial release
+*/
